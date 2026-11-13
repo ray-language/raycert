@@ -1,42 +1,73 @@
 //! The object identifiers raycert reads and writes, and their short names.
 
 pub const CN: string = "2.5.4.3";
+
 pub const COUNTRY: string = "2.5.4.6";
+
 pub const LOCALITY: string = "2.5.4.7";
+
 pub const STATE: string = "2.5.4.8";
+
 pub const ORG: string = "2.5.4.10";
+
 pub const ORG_UNIT: string = "2.5.4.11";
+
 pub const SERIAL_NUMBER: string = "2.5.4.5";
+
 pub const EMAIL: string = "1.2.840.113549.1.9.1";
+
 pub const EXTENSION_REQUEST: string = "1.2.840.113549.1.9.14";
 
 pub const RSA_ENCRYPTION: string = "1.2.840.113549.1.1.1";
+
 pub const SHA256_WITH_RSA: string = "1.2.840.113549.1.1.11";
+
 pub const SHA384_WITH_RSA: string = "1.2.840.113549.1.1.12";
+
 pub const SHA512_WITH_RSA: string = "1.2.840.113549.1.1.13";
+
 pub const SHA1_WITH_RSA: string = "1.2.840.113549.1.1.5";
+
 pub const RSA_PSS: string = "1.2.840.113549.1.1.10";
+
 pub const EC_PUBLIC_KEY: string = "1.2.840.10045.2.1";
+
 pub const P256: string = "1.2.840.10045.3.1.7";
+
 pub const P384: string = "1.3.132.0.34";
+
 pub const P521: string = "1.3.132.0.35";
+
 pub const ECDSA_SHA256: string = "1.2.840.10045.4.3.2";
+
 pub const ECDSA_SHA384: string = "1.2.840.10045.4.3.3";
+
 pub const ECDSA_SHA512: string = "1.2.840.10045.4.3.4";
+
 pub const ED25519: string = "1.3.101.112";
 
 pub const SUBJECT_KEY_ID: string = "2.5.29.14";
+
 pub const KEY_USAGE: string = "2.5.29.15";
+
 pub const SUBJECT_ALT_NAME: string = "2.5.29.17";
+
 pub const BASIC_CONSTRAINTS: string = "2.5.29.19";
+
 pub const CRL_DISTRIBUTION: string = "2.5.29.31";
+
 pub const CERT_POLICIES: string = "2.5.29.32";
+
 pub const AUTHORITY_KEY_ID: string = "2.5.29.35";
+
 pub const EXT_KEY_USAGE: string = "2.5.29.37";
+
 pub const AUTHORITY_INFO_ACCESS: string = "1.3.6.1.5.5.7.1.1";
+
 pub const SCT_LIST: string = "1.3.6.1.4.1.11129.2.4.2";
 
 pub const SERVER_AUTH: string = "1.3.6.1.5.5.7.3.1";
+
 pub const CLIENT_AUTH: string = "1.3.6.1.5.5.7.3.2";
 
 /// A readable name for an OID, or the OID itself.

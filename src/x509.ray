@@ -225,7 +225,7 @@ pub fn parse(b: bytes) -> Result<Cert, string> {
     let tbs = der.expect(top[0], der.TAG_SEQUENCE, "TBSCertificate")?;
     var i = 0;
     var version = 1;
-    if (tbs.len() > 0 && tbs[0].tag == 0xa0) {
+    if (tbs.len() > 0 && tbs[0].tag == 0xA0) {
         let v = der.children(tbs[0])?;
         if (v.len() != 1) {
             return Result.Err("bad version field");
@@ -249,7 +249,7 @@ pub fn parse(b: bytes) -> Result<Cert, string> {
     var j = i + 6;
     while (j < tbs.len()) {
         let t = tbs[j];
-        if (t.tag == 0xa3) {
+        if (t.tag == 0xA3) {
             let inner = der.children(t)?;
             if (inner.len() != 1) {
                 return Result.Err("bad extensions wrapper");
@@ -260,23 +260,25 @@ pub fn parse(b: bytes) -> Result<Cert, string> {
         }
         j = j + 1;
     }
-    Result.Ok(Cert {
-        raw: b,
-        tbs: top[0].raw,
-        version: version,
-        serial: serial,
-        tbs_sig: tbs_sig,
-        issuer: issuer,
-        issuer_raw: tbs[i + 2].raw,
-        not_before: der.as_time(validity[0])?,
-        not_after: der.as_time(validity[1])?,
-        subject: subject,
-        subject_raw: tbs[i + 4].raw,
-        spki: spki,
-        exts: exts,
-        sig_alg: parse_alg(top[1])?,
-        signature: der.as_bits(top[2])?,
-    })
+    Result.Ok(
+        Cert {
+            raw: b,
+            tbs: top[0].raw,
+            version: version,
+            serial: serial,
+            tbs_sig: tbs_sig,
+            issuer: issuer,
+            issuer_raw: tbs[i + 2].raw,
+            not_before: der.as_time(validity[0])?,
+            not_after: der.as_time(validity[1])?,
+            subject: subject,
+            subject_raw: tbs[i + 4].raw,
+            spki: spki,
+            exts: exts,
+            sig_alg: parse_alg(top[1])?,
+            signature: der.as_bits(top[2])?
+        }
+    )
 }
 
 // ---------------------------------------------------------------- extensions
@@ -294,8 +296,8 @@ pub fn find_ext(c: Cert, o: string) -> Option<Ext> {
 pub fn general_names(b: bytes) -> Result<[string], string> {
     var out: [string] = [];
     for g in der.expect(der.parse(b)?, der.TAG_SEQUENCE, "GeneralNames")? {
-        let kind = g.tag & 0x1f;
-        if ((g.tag & 0xc0) != 0x80) {
+        let kind = g.tag & 0x1F;
+        if ((g.tag & 0xC0) != 0x80) {
             out.push("?");
         } else if (kind == 2) {
             out.push("DNS:${from_utf8(g.body)?}");
@@ -379,7 +381,7 @@ const KEY_USAGE_NAMES: [string] = [
     "keyCertSign",
     "cRLSign",
     "encipherOnly",
-    "decipherOnly",
+    "decipherOnly"
 ];
 
 pub fn key_usage(c: Cert) -> Result<[string], string> {
@@ -424,7 +426,8 @@ pub fn authority_key_id(c: Cert) -> Option<bytes> {
     match (find_ext(c, oid.AUTHORITY_KEY_ID)) {
         Option.None => Option.None,
         Option.Some(e) => {
-            let kids = der.parse(e.value).and_then(fn(n: Node) -> Result<[Node], string> { der.children(n) });
+            let kids = der.parse(e.value)
+                .and_then(fn(n: Node) -> Result<[Node], string> { der.children(n) });
             match (kids) {
                 Result.Ok(ks) => {
                     for k in ks {

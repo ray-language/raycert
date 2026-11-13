@@ -13,7 +13,8 @@ const NOW: int = 1_790_000_000_000;
 
 fn ca_for(kind: KeyKind) -> (keys.PrivKey, x509.Cert) {
     let k = keys.generate(kind).unwrap();
-    let der_ca = issue.self_signed_ca(k, x509.parse_dn("CN=Test CA,O=raycert,C=ES").unwrap(), NOW, 30).unwrap();
+    let der_ca = issue.self_signed_ca(k, x509.parse_dn("CN=Test CA,O=raycert,C=ES").unwrap(), NOW, 30)
+        .unwrap();
     (k, x509.parse(der_ca).unwrap())
 }
 
@@ -24,7 +25,12 @@ fn each_key_type_signs_a_verifiable_chain() {
         assert(verify.is_valid(verify.cert_signed_by(ca, ca)));
         assert_eq(ca.sig_alg.oid, keys.sig_alg(k).oid);
         let lk = keys.generate(KeyKind.P256).unwrap();
-        let req = issue.LeafRequest { subject: x509.cn_name("svc.test"), spki: keys.spki_der(lk).unwrap(), names: ["svc.test", "10.0.0.1"], days: 7 };
+        let req = issue.LeafRequest {
+            subject: x509.cn_name("svc.test"),
+            spki: keys.spki_der(lk).unwrap(),
+            names: ["svc.test", "10.0.0.1"],
+            days: 7
+        };
         let leaf = x509.parse(issue.leaf(req, k, ca, NOW).unwrap()).unwrap();
         let links = verify.chain([leaf, ca], []);
         assert_eq(links.len(), 2);
@@ -61,7 +67,10 @@ fn key_usage_bits_match_openssl() {
 fn ip_addresses_and_dns_names_are_told_apart() {
     assert_eq(hex.hex_encode(issue.parse_ip("127.0.0.1").unwrap()), "7f000001");
     assert_eq(hex.hex_encode(issue.parse_ip("::1").unwrap()), "00000000000000000000000000000001");
-    assert_eq(hex.hex_encode(issue.parse_ip("2001:db8::8:800:200c:417a").unwrap()), "20010db8000000000008080020 0c417a".replace(" ", ""));
+    assert_eq(
+        hex.hex_encode(issue.parse_ip("2001:db8::8:800:200c:417a").unwrap()),
+        "20010db8000000000008080020 0c417a".replace(" ", "")
+    );
     assert_eq(issue.parse_ip("256.0.0.1"), Option.None);
     assert_eq(issue.parse_ip("1.2.3"), Option.None);
     assert_eq(issue.parse_ip("1::2::3"), Option.None);
@@ -86,7 +95,12 @@ fn serials_are_positive_and_random() {
 @test
 fn a_leaf_never_outlives_its_ca() {
     let (k, ca) = ca_for(KeyKind.P256);
-    let req = issue.LeafRequest { subject: x509.cn_name("long.test"), spki: keys.spki_der(k).unwrap(), names: ["long.test"], days: 400 };
+    let req = issue.LeafRequest {
+        subject: x509.cn_name("long.test"),
+        spki: keys.spki_der(k).unwrap(),
+        names: ["long.test"],
+        days: 400
+    };
     let leaf = x509.parse(issue.leaf(req, k, ca, NOW).unwrap()).unwrap();
     assert_eq(leaf.not_after, ca.not_after);
 }

@@ -40,7 +40,9 @@ pub fn signature(alg: string, key: Spki, msg: bytes, sig: bytes) -> Check {
             return Check.Invalid("ECDSA signature, ${oid.name(key.alg)} key");
         }
         if (key.curve != oid.P256) {
-            return Check.Unsupported("ecdsa-with-SHA256 on ${oid.name(key.curve)}: std/crypto verifies only P-256");
+            return Check.Unsupported(
+                "ecdsa-with-SHA256 on ${oid.name(key.curve)}: std/crypto verifies only P-256"
+            );
         }
         return verdict(crypto.p256_verify_asn1(key.key, msg, sig), "ECDSA P-256");
     }
@@ -98,13 +100,13 @@ pub fn chain(certs: [Cert], anchors: [Cert]) -> [Link] {
                 subject: x509.format_name(c.subject),
                 issuer: x509.format_name(iss.subject),
                 check: cert_signed_by(c, iss),
-                name_ok: c.issuer_raw == iss.subject_raw,
+                name_ok: c.issuer_raw == iss.subject_raw
             },
             Option.None => Link {
                 subject: x509.format_name(c.subject),
                 issuer: x509.format_name(c.issuer),
                 check: Check.Unsupported("issuer not in the chain nor in the trust store"),
-                name_ok: true,
+                name_ok: true
             },
         };
         out.push(link);

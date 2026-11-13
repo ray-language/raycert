@@ -12,10 +12,16 @@ fn isrg_root_x1_matches_openssl() {
     let certs = ops.load_certs("tests/fixtures/isrg-root-x1.pem").unwrap();
     assert_eq(certs.len(), 1);
     let c = certs[0];
-    assert_eq(x509.format_name(c.subject), "C=US, O=Internet Security Research Group, CN=ISRG Root X1");
+    assert_eq(
+        x509.format_name(c.subject),
+        "C=US, O=Internet Security Research Group, CN=ISRG Root X1"
+    );
     assert_eq(c.version, 3);
     assert_eq(x509.colon_hex(c.serial), "82:10:CF:B0:D2:40:E3:59:44:63:E0:BB:63:82:8B:00");
-    assert_eq(x509.fingerprint_sha256(c), "96:BC:EC:06:26:49:76:F3:74:60:77:9A:CF:28:C5:A7:CF:E8:A3:C0:AA:E1:1A:8F:FC:EE:05:C0:BD:DF:08:C6");
+    assert_eq(
+        x509.fingerprint_sha256(c),
+        "96:BC:EC:06:26:49:76:F3:74:60:77:9A:CF:28:C5:A7:CF:E8:A3:C0:AA:E1:1A:8F:FC:EE:05:C0:BD:DF:08:C6"
+    );
     assert_eq(x509.key_description(c.spki), "RSA 4096");
     assert_eq(x509.date_text(c.not_before), "2015-06-04T11:04:38Z");
     assert_eq(x509.date_text(c.not_after), "2035-06-04T11:04:38Z");
@@ -35,7 +41,10 @@ fn pebble_leaf_has_an_empty_subject_and_a_critical_san() {
     let san = x509.find_ext(leaf, oid.SUBJECT_ALT_NAME).unwrap();
     assert(san.critical);
     assert_eq(x509.colon_hex(leaf.serial), "56:90:88:42:16:0F:4E:14");
-    assert_eq(x509.fingerprint_sha256(leaf), "20:1D:3A:BF:DA:FB:ED:E4:21:84:9D:A3:30:F7:8A:E7:86:B1:77:78:25:65:3F:5C:E8:8A:64:4D:6E:A6:D1:48");
+    assert_eq(
+        x509.fingerprint_sha256(leaf),
+        "20:1D:3A:BF:DA:FB:ED:E4:21:84:9D:A3:30:F7:8A:E7:86:B1:77:78:25:65:3F:5C:E8:8A:64:4D:6E:A6:D1:48"
+    );
     let links = verify.chain(certs, []);
     assert(verify.is_valid(links[0].check));
     assert(links[0].name_ok);
@@ -54,7 +63,7 @@ fn a_tampered_certificate_does_not_verify() {
     octets[at] = octets[at] ^ 1;
     let bad = x509.parse(bytes_of(octets)).unwrap();
     match (verify.cert_signed_by(bad, certs[0])) {
-        verify.Check.Invalid(_) => {},
+        verify.Check.Invalid(_) => { },
         other => panic("expected Invalid, got ${verify.check_text(other)}"),
     }
 }

@@ -31,11 +31,18 @@ pub fn jwk_public(kind: KeyKind, raw: bytes) -> Result<json.Obj, string> {
             }
             let x = base64url(raw.sub_bytes(1, 33));
             let y = base64url(raw.sub_bytes(33, 65));
-            Result.Ok(json.obj().field("crv", "P-256").field("kty", "EC").field("x", x).field("y", y))
+            Result.Ok(json.obj()
+                .field("crv", "P-256")
+                .field("kty", "EC")
+                .field("x", x)
+                .field("y", y))
         },
         KeyKind.Rsa(_) => {
             let (n, e) = crypto.rsa_public_components(raw)?;
-            Result.Ok(json.obj().field("e", base64url(e)).field("kty", "RSA").field("n", base64url(n)))
+            Result.Ok(json.obj()
+                .field("e", base64url(e))
+                .field("kty", "RSA")
+                .field("n", base64url(n)))
         },
     }
 }
@@ -63,7 +70,11 @@ pub fn sign(k: PrivKey, protected_json: string, payload: string) -> Result<strin
     let p64 = base64url(protected_json.to_bytes());
     let b64 = if (payload == "") { "" } else { base64url(payload.to_bytes()) };
     let sig = keys.sign_jws(k, "${p64}.${b64}".to_bytes())?;
-    Result.Ok(json.obj().field("protected", p64).field("payload", b64).field("signature", base64url(sig)).render())
+    Result.Ok(json.obj()
+        .field("protected", p64)
+        .field("payload", b64)
+        .field("signature", base64url(sig))
+        .render())
 }
 
 /// The key authorization of an http-01 challenge: `token.thumbprint`.

@@ -8,21 +8,43 @@ import std/crypto;
 import std/net;
 
 const CIPHER_SUITES: [int] = [
-    0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc009, 0xc013, 0xc00a, 0xc014, 0x009c,
-    0x009d, 0x002f, 0x0035,
+    0xC02B,
+    0xC02F,
+    0xC02C,
+    0xC030,
+    0xCCA9,
+    0xCCA8,
+    0xC009,
+    0xC013,
+    0xC00A,
+    0xC014,
+    0x009C,
+    0x009D,
+    0x002F,
+    0x0035
 ];
 
 const SIG_ALGS: [int] = [
-    0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0807, 0x0203,
-    0x0201,
+    0x0403,
+    0x0503,
+    0x0603,
+    0x0804,
+    0x0805,
+    0x0806,
+    0x0401,
+    0x0501,
+    0x0601,
+    0x0807,
+    0x0203,
+    0x0201
 ];
 
 fn u16(n: int) -> bytes {
-    bytes_of([(n >> 8) & 0xff, n & 0xff])
+    bytes_of([(n >> 8) & 0xFF, n & 0xFF])
 }
 
 fn u24(n: int) -> bytes {
-    bytes_of([(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff])
+    bytes_of([(n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF])
 }
 
 fn ext(kind: int, body: bytes) -> bytes {
@@ -46,22 +68,24 @@ pub fn client_hello(host: string) -> bytes {
         let entry = bytes_concat([bytes_of([0]), u16(name.len()), name]);
         exts.push(ext(0x0000, bytes_concat([u16(entry.len()), entry])));
     }
-    exts.push(ext(0x000a, u16_list([0x001d, 0x0017, 0x0018])));
-    exts.push(ext(0x000b, bytes_of([1, 0])));
-    exts.push(ext(0x000d, u16_list(SIG_ALGS)));
+    exts.push(ext(0x000A, u16_list([0x001D, 0x0017, 0x0018])));
+    exts.push(ext(0x000B, bytes_of([1, 0])));
+    exts.push(ext(0x000D, u16_list(SIG_ALGS)));
     exts.push(ext(0x0017, bytes_of([])));
-    exts.push(ext(0xff01, bytes_of([0])));
+    exts.push(ext(0xFF01, bytes_of([0])));
     let ext_bytes = exts.build();
     let suites = u16_list(CIPHER_SUITES);
-    let body = bytes_concat([
-        bytes_of([3, 3]),
-        crypto.random_bytes(32),
-        bytes_of([0]),
-        suites,
-        bytes_of([1, 0]),
-        u16(ext_bytes.len()),
-        ext_bytes,
-    ]);
+    let body = bytes_concat(
+        [
+            bytes_of([3, 3]),
+            crypto.random_bytes(32),
+            bytes_of([0]),
+            suites,
+            bytes_of([1, 0]),
+            u16(ext_bytes.len()),
+            ext_bytes
+        ]
+    );
     let hs = bytes_concat([bytes_of([1]), u24(body.len()), body]);
     bytes_concat([bytes_of([22, 3, 1]), u16(hs.len()), hs])
 }
@@ -117,7 +141,11 @@ pub fn feed(r: Reader, chunk: bytes) -> Result<Option<Flight>, string> {
             return Result.Ok(Option.Some(Flight.Alert(body[0], body[1])));
         }
         if (kind != 22) {
-            return Result.Ok(Option.Some(Flight.NotTls12("unexpected record type ${kind} before the certificate")));
+            return Result.Ok(
+                Option.Some(
+                    Flight.NotTls12("unexpected record type ${kind} before the certificate")
+                )
+            );
         }
         r.handshake = bytes_concat([r.handshake, body]);
         while (r.handshake.len() >= 4) {
@@ -199,7 +227,7 @@ fn exchange(h: int, host: string) -> Result<[bytes], string> {
             return Result.Err("connection closed before the server sent its certificate");
         }
         match (feed(r, chunk)?) {
-            Option.None => {},
+            Option.None => { },
             Option.Some(f) => {
                 return match (f) {
                     Flight.Chain(certs) => Result.Ok(certs),

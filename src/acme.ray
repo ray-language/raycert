@@ -56,7 +56,12 @@ fn trace(c: Client, line: string) {
 
 /// Reads the directory. `insecure` skips TLS verification (Pebble's own test CA); prefer
 /// `SSL_CERT_FILE=pebble.minica.pem`, which keeps it on.
-pub fn connect(directory: string, key: PrivKey, insecure: bool, verbose: bool) -> Result<Client, string> {
+pub fn connect(
+    directory: string,
+    key: PrivKey,
+    insecure: bool,
+    verbose: bool
+) -> Result<Client, string> {
     var o = http.options();
     o.insecure_skip_verify = insecure;
     let r = http.request_opts("GET", directory, bytes_of([]), [], o)?;
@@ -65,16 +70,18 @@ pub fn connect(directory: string, key: PrivKey, insecure: bool, verbose: bool) -
     }
     let j = json.parse(from_utf8(r.body)?)?;
     let get = fn(k: string) -> Result<string, string> { json.get_string(j, k).ok_or("directory has no ${k}") };
-    Result.Ok(Client {
-        key: key,
-        new_nonce: get("newNonce")?,
-        new_account: get("newAccount")?,
-        new_order: get("newOrder")?,
-        kid: "",
-        nonce: "",
-        insecure: insecure,
-        verbose: verbose,
-    })
+    Result.Ok(
+        Client {
+            key: key,
+            new_nonce: get("newNonce")?,
+            new_account: get("newAccount")?,
+            new_order: get("newOrder")?,
+            kid: "",
+            nonce: "",
+            insecure: insecure,
+            verbose: verbose
+        }
+    )
 }
 
 fn fresh_nonce(c: Client) -> Result<string, string> {
@@ -166,7 +173,7 @@ pub fn order_of(url: string, j: Json) -> Order {
         authorizations: strings(j, "authorizations"),
         finalize: json.get_string(j, "finalize").unwrap_or(""),
         certificate: json.get_string(j, "certificate").unwrap_or(""),
-        problem: problem_of(j),
+        problem: problem_of(j)
     }
 }
 
@@ -187,12 +194,14 @@ pub fn get_order(c: Client, url: string) -> Result<Order, string> {
 pub fn authz_of(j: Json) -> Authz {
     var chs: [Challenge] = [];
     for ch in json.get_array(j, "challenges").unwrap_or([]) {
-        chs.push(Challenge {
-            kind: json.get_string(ch, "type").unwrap_or(""),
-            url: json.get_string(ch, "url").unwrap_or(""),
-            token: json.get_string(ch, "token").unwrap_or(""),
-            status: json.get_string(ch, "status").unwrap_or(""),
-        });
+        chs.push(
+            Challenge {
+                kind: json.get_string(ch, "type").unwrap_or(""),
+                url: json.get_string(ch, "url").unwrap_or(""),
+                token: json.get_string(ch, "token").unwrap_or(""),
+                status: json.get_string(ch, "status").unwrap_or("")
+            }
+        );
     }
     var problem = "";
     for ch in json.get_array(j, "challenges").unwrap_or([]) {
@@ -205,7 +214,12 @@ pub fn authz_of(j: Json) -> Authz {
         Option.Some(i) => json.get_string(i, "value").unwrap_or("?"),
         Option.None => "?",
     };
-    Authz { identifier: ident, status: json.get_string(j, "status").unwrap_or("?"), challenges: chs, problem: problem }
+    Authz {
+        identifier: ident,
+        status: json.get_string(j, "status").unwrap_or("?"),
+        challenges: chs,
+        problem: problem
+    }
 }
 
 pub fn get_authz(c: Client, url: string) -> Result<Authz, string> {

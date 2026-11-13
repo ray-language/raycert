@@ -10,6 +10,7 @@ import std/pem;
 from keys import PrivKey;
 
 pub const PRIVATE_FILE: int = 0o600;
+
 pub const PRIVATE_DIR: int = 0o700;
 
 pub fn default_home() -> string {
@@ -143,7 +144,12 @@ pub fn check_name(name: string) -> Result<int, string> {
         return Result.Err("bad certificate name '${name}'");
     }
     for c in name.chars() {
-        let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+        let ok = (c >= 'a' && c <= 'z')
+            || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9')
+            || c == '-'
+            || c == '_'
+            || c == '.';
         if (!ok) {
             return Result.Err("bad certificate name '${name}' (letters, digits, - _ . only)");
         }
@@ -170,20 +176,27 @@ pub fn parse_meta(text: string) -> Result<Meta, string> {
     for n in json.get_array(j, "names").unwrap_or([]) {
         names.push(json.as_string(n).unwrap_or(""));
     }
-    Result.Ok(Meta {
-        name: json.get_string(j, "name").ok_or("meta.json without name")?,
-        source: json.get_string(j, "source").unwrap_or("local"),
-        names: names,
-        key_kind: json.get_string(j, "key").unwrap_or("p256"),
-        days: json.get_int(j, "days").unwrap_or(90),
-        directory: json.get_string(j, "directory").unwrap_or(""),
-        http_port: json.get_int(j, "http_port").unwrap_or(80),
-        http_host: json.get_string(j, "http_host").unwrap_or("0.0.0.0"),
-    })
+    Result.Ok(
+        Meta {
+            name: json.get_string(j, "name").ok_or("meta.json without name")?,
+            source: json.get_string(j, "source").unwrap_or("local"),
+            names: names,
+            key_kind: json.get_string(j, "key").unwrap_or("p256"),
+            days: json.get_int(j, "days").unwrap_or(90),
+            directory: json.get_string(j, "directory").unwrap_or(""),
+            http_port: json.get_int(j, "http_port").unwrap_or(80),
+            http_host: json.get_string(j, "http_host").unwrap_or("0.0.0.0")
+        }
+    )
 }
 
 /// Writes key.pem (0600), cert.pem (the leaf), chain.pem (leaf + issuers) and meta.json.
-pub fn save_issued(home: string, m: Meta, key: PrivKey, chain_der: [bytes]) -> Result<string, string> {
+pub fn save_issued(
+    home: string,
+    m: Meta,
+    key: PrivKey,
+    chain_der: [bytes]
+) -> Result<string, string> {
     check_name(m.name)?;
     fs.mkdir("${home}/certs")?;
     let dir = cert_dir(home, m.name);

@@ -9,7 +9,9 @@ from x509 import Cert;
 
 pub fn describe(c: Cert, now: int) -> [string] {
     var out: [string] = [];
-    let row = fn(label: string, value: string) { out.push("  ${text.pad_right(label, 13, " ")}${value}"); };
+    let row = fn(label: string, value: string) {
+        out.push("  ${text.pad_right(label, 13, " ")}${value}");
+    };
     row("Subject:", show_name(c.subject));
     row("Issuer:", show_name(c.issuer));
     row("Serial:", x509.colon_hex(c.serial));
@@ -38,7 +40,7 @@ pub fn describe(c: Cert, now: int) -> [string] {
             let p = if (ca && path >= 0) { " (path length ${path})" } else { "" };
             row("CA:", "${if (ca) { "yes" } else { "no" }}${p}");
         },
-        Result.Ok(Option.None) => {},
+        Result.Ok(Option.None) => { },
         Result.Err(e) => row("CA:", "<unreadable: ${e}>"),
     }
     let ku = x509.key_usage(c).unwrap_or([]);

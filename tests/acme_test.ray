@@ -58,7 +58,14 @@ fn json_reply(status: int, body: string, nonce: string) -> webserver.Response {
 }
 
 fn problem(status: int, kind: string, detail: string, nonce: string) -> webserver.Response {
-    var r = json_reply(status, json.obj().field("type", "urn:ietf:params:acme:error:${kind}").field("detail", detail).render(), nonce);
+    var r = json_reply(
+        status,
+        json.obj()
+            .field("type", "urn:ietf:params:acme:error:${kind}")
+            .field("detail", detail)
+            .render(),
+        nonce
+    );
     r.headers.insert("Content-Type", "application/problem+json");
     r
 }
@@ -70,7 +77,11 @@ fn new_nonce(st: Channel<Msg>) -> string {
 }
 
 /// Checks the JWS of a POST; returns (account thumbprint, payload text).
-fn check_jws(st: Channel<Msg>, req: webserver.Request, base: string) -> Result<(string, string), string> {
+fn check_jws(
+    st: Channel<Msg>,
+    req: webserver.Request,
+    base: string
+) -> Result<(string, string), string> {
     let body = json.parse(from_utf8(req.body)?)?;
     let p64 = json.get_string(body, "protected").ok_or("no protected")?;
     let b64 = json.get_string(body, "payload").ok_or("no payload")?;
@@ -97,7 +108,11 @@ fn check_jws(st: Channel<Msg>, req: webserver.Request, base: string) -> Result<(
             }
             x = json.get_string(j, "x").unwrap_or("");
             y = json.get_string(j, "y").unwrap_or("");
-            tp = jws.thumbprint_of(json.obj().field("crv", "P-256").field("kty", "EC").field("x", x).field("y", y));
+            tp = jws.thumbprint_of(json.obj()
+                .field("crv", "P-256")
+                .field("kty", "EC")
+                .field("x", x)
+                .field("y", y));
             put(st, "acct:${tp}", "${x}.${y}");
         },
         Option.None => {
@@ -111,7 +126,9 @@ fn check_jws(st: Channel<Msg>, req: webserver.Request, base: string) -> Result<(
             y = xy[1];
         },
     }
-    let point = bytes_concat([bytes_of([4]), base64.base64url_decode(x)?, base64.base64url_decode(y)?]);
+    let point = bytes_concat(
+        [bytes_of([4]), base64.base64url_decode(x)?, base64.base64url_decode(y)?]
+    );
     if (!crypto.p256_verify(point, "${p64}.${b64}".to_bytes(), sig)) {
         return Result.Err("bad signature");
     }
@@ -142,9 +159,19 @@ fn validate(st: Channel<Msg>, tp: string, name: string, port: int) -> string {
     }
 }
 
-fn handle(st: Channel<Msg>, base: string, http_port: int, ca_pem: string, req: webserver.Request) -> webserver.Response {
+fn handle(
+    st: Channel<Msg>,
+    base: string,
+    http_port: int,
+    ca_pem: string,
+    req: webserver.Request
+) -> webserver.Response {
     if (req.path == "/dir") {
-        let d = json.obj().field("newNonce", "${base}/nonce").field("newAccount", "${base}/acct").field("newOrder", "${base}/order").render();
+        let d = json.obj()
+            .field("newNonce", "${base}/nonce")
+            .field("newAccount", "${base}/acct")
+            .field("newOrder", "${base}/order")
+            .render();
         return json_reply(200, d, new_nonce(st));
     }
     if (req.path == "/nonce") {
@@ -177,13 +204,25 @@ fn handle(st: Channel<Msg>, base: string, http_port: int, ca_pem: string, req: w
         return r;
     }
     if (req.path == "/order/1") {
-        return json_reply(200, order_json(st, base, tp, lookup(st, "order").split(","), http_port), nonce);
+        return json_reply(
+            200,
+            order_json(st, base, tp, lookup(st, "order").split(","), http_port),
+            nonce
+        );
     }
     if (req.path.starts_with("/authz/")) {
         let name = req.path.substring(7, req.path.len());
         let status = validate(st, tp, name, http_port);
-        let ch = json.obj().field("type", "http-01").field("url", "${base}/chal/${name}").field("token", token_of(name)).field("status", status);
-        let body = json.obj().field("status", status).field("identifier", json.obj().field("type", "dns").field("value", name)).field("challenges", json.arr().item(ch)).render();
+        let ch = json.obj()
+            .field("type", "http-01")
+            .field("url", "${base}/chal/${name}")
+            .field("token", token_of(name))
+            .field("status", status);
+        let body = json.obj()
+            .field("status", status)
+            .field("identifier", json.obj().field("type", "dns").field("value", name))
+            .field("challenges", json.arr().item(ch))
+            .render();
         return json_reply(200, body, nonce);
     }
     if (req.path.starts_with("/chal/")) {
@@ -191,12 +230,17 @@ fn handle(st: Channel<Msg>, base: string, http_port: int, ca_pem: string, req: w
         return json_reply(200, "{}", nonce);
     }
     if (req.path == "/finalize/1") {
-        let csr_der = base64.base64url_decode(json.get_string(json.parse(payload).unwrap(), "csr").unwrap_or("")).unwrap();
+        let csr_der = base64.base64url_decode(json.get_string(json.parse(payload).unwrap(), "csr").unwrap_or(""))
+            .unwrap();
         match (sign_csr(ca_pem, csr_der)) {
             Result.Ok(chain) => put(st, "cert", chain),
             Result.Err(e) => return problem(400, "badCSR", e, nonce),
         }
-        return json_reply(200, order_json(st, base, tp, lookup(st, "order").split(","), http_port), nonce);
+        return json_reply(
+            200,
+            order_json(st, base, tp, lookup(st, "order").split(","), http_port),
+            nonce
+        );
     }
     if (req.path == "/cert/1") {
         var r = json_reply(200, lookup(st, "cert"), nonce);
@@ -217,7 +261,10 @@ fn order_json(st: Channel<Msg>, base: string, tp: string, names: [string], port:
     }
     let has_cert = lookup(st, "cert") != "";
     let status = if (has_cert) { "valid" } else if (all_valid) { "ready" } else { "pending" };
-    var o = json.obj().field("status", status).field("authorizations", authzs).field("finalize", "${base}/finalize/1");
+    var o = json.obj()
+        .field("status", status)
+        .field("authorizations", authzs)
+        .field("finalize", "${base}/finalize/1");
     if (has_cert) {
         o = o.field("certificate", "${base}/cert/1");
     }
@@ -235,7 +282,12 @@ fn sign_csr(ca_pem: string, csr_der: bytes) -> Result<string, string> {
     for n in c.names {
         names.push(n.strip_prefix("DNS:").unwrap_or(n));
     }
-    let req = issue.LeafRequest { subject: x509.Name { rdns: [] }, spki: c.spki.raw, names: names, days: 30 };
+    let req = issue.LeafRequest {
+        subject: x509.Name { rdns: [] },
+        spki: c.spki.raw,
+        names: names,
+        days: 30
+    };
     let leaf = issue.leaf(req, ca_key, ca, time.now())?;
     Result.Ok(pem.encode("CERTIFICATE", leaf) + pem.encode("CERTIFICATE", ca.raw))
 }
@@ -251,16 +303,21 @@ fn free_port() -> int {
 @test
 fn obtains_a_certificate_from_a_scripted_acme_server() {
     let ca_key = keys.generate(KeyKind.P256).unwrap();
-    let ca_der = issue.self_signed_ca(ca_key, x509.cn_name("Fake ACME CA"), time.now(), 30).unwrap();
+    let ca_der = issue.self_signed_ca(ca_key, x509.cn_name("Fake ACME CA"), time.now(), 30)
+        .unwrap();
     let ca_pem = keys.to_pem(ca_key) + pem.encode("CERTIFICATE", ca_der);
     let listener = net.tcp_listen("127.0.0.1", 0).unwrap();
     let base = "http://127.0.0.1:${net.local_port(listener)}";
     let http_port = free_port();
     let st: Channel<Msg> = Channel.new();
     let stop: Channel<int> = Channel.new();
-    spawn(fn() { state_actor(st); });
+    spawn(fn() {
+        state_actor(st);
+    });
     let server = spawn(fn() -> Result<int, string> {
-        webserver.serve_options_on(listener, webserver.options().with_stop(stop).quiet(), fn() -> fn(webserver.Request) -> webserver.Response {
+        webserver.serve_options_on(listener, webserver.options()
+            .with_stop(stop)
+            .quiet(), fn() -> fn(webserver.Request) -> webserver.Response {
             let s = st;
             let b = base;
             let hp = http_port;
@@ -276,7 +333,7 @@ fn obtains_a_certificate_from_a_scripted_acme_server() {
         http_port: http_port,
         insecure: false,
         verbose: false,
-        timeout_ms: 15000,
+        timeout_ms: 15000
     };
     let account = keys.generate(KeyKind.P256).unwrap();
     let cert_key = keys.generate(KeyKind.Ed25519).unwrap();
@@ -301,13 +358,23 @@ fn obtains_a_certificate_from_a_scripted_acme_server() {
 
 @test
 fn acme_documents_parse() {
-    let o = acme.order_of("u", json.parse("{\"status\":\"invalid\",\"authorizations\":[\"a\",\"b\"],\"finalize\":\"f\",\"error\":{\"type\":\"urn:ietf:params:acme:error:rejectedIdentifier\",\"detail\":\"no\"}}").unwrap());
+    let o = acme.order_of(
+        "u",
+        json.parse("{\"status\":\"invalid\",\"authorizations\":[\"a\",\"b\"],\"finalize\":\"f\",\"error\":{\"type\":\"urn:ietf:params:acme:error:rejectedIdentifier\",\"detail\":\"no\"}}")
+            .unwrap()
+    );
     assert_eq(o.status, "invalid");
     assert_eq(o.authorizations, ["a", "b"]);
     assert_eq(o.problem, "urn:ietf:params:acme:error:rejectedIdentifier: no");
-    let a = acme.authz_of(json.parse("{\"status\":\"pending\",\"identifier\":{\"type\":\"dns\",\"value\":\"x.test\"},\"challenges\":[{\"type\":\"dns-01\",\"url\":\"d\",\"token\":\"t1\"},{\"type\":\"http-01\",\"url\":\"h\",\"token\":\"t2\",\"status\":\"pending\"}]}").unwrap());
+    let a = acme.authz_of(json.parse("{\"status\":\"pending\",\"identifier\":{\"type\":\"dns\",\"value\":\"x.test\"},\"challenges\":[{\"type\":\"dns-01\",\"url\":\"d\",\"token\":\"t1\"},{\"type\":\"http-01\",\"url\":\"h\",\"token\":\"t2\",\"status\":\"pending\"}]}")
+        .unwrap());
     assert_eq(a.identifier, "x.test");
     assert_eq(acme.http01(a).unwrap().token, "t2");
-    assert_eq(acme.problem_text("{\"type\":\"urn:ietf:params:acme:error:badNonce\",\"detail\":\"stale\"}".to_bytes()), "badNonce: stale");
+    assert_eq(
+        acme.problem_text(
+            "{\"type\":\"urn:ietf:params:acme:error:badNonce\",\"detail\":\"stale\"}".to_bytes()
+        ),
+        "badNonce: stale"
+    );
     assert_eq(acme.problem_text("plain".to_bytes()), "plain");
 }

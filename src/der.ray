@@ -5,19 +5,33 @@ import std/collections/bytesbuilder as bb;
 import std/time;
 
 pub const TAG_BOOLEAN: int = 0x01;
+
 pub const TAG_INTEGER: int = 0x02;
+
 pub const TAG_BIT_STRING: int = 0x03;
+
 pub const TAG_OCTET_STRING: int = 0x04;
+
 pub const TAG_NULL: int = 0x05;
+
 pub const TAG_OID: int = 0x06;
-pub const TAG_UTF8: int = 0x0c;
+
+pub const TAG_UTF8: int = 0x0C;
+
 pub const TAG_PRINTABLE: int = 0x13;
+
 pub const TAG_T61: int = 0x14;
+
 pub const TAG_IA5: int = 0x16;
+
 pub const TAG_UTC_TIME: int = 0x17;
+
 pub const TAG_GEN_TIME: int = 0x18;
-pub const TAG_BMP: int = 0x1e;
+
+pub const TAG_BMP: int = 0x1E;
+
 pub const TAG_SEQUENCE: int = 0x30;
+
 pub const TAG_SET: int = 0x31;
 
 /// Anything that serializes itself as one DER TLV.
@@ -68,7 +82,7 @@ pub fn header(tag: int, len: int) -> bytes {
     var octets: [int] = [];
     var n = len;
     while (n > 0) {
-        octets.insert_at(0, n & 0xff);
+        octets.insert_at(0, n & 0xFF);
         n = n >> 8;
     }
     bytes_of([tag, 0x80 | octets.len()] + octets)
@@ -114,7 +128,7 @@ fn bytes_less(a: bytes, b: bytes) -> bool {
 
 pub fn encode(v: Asn1) -> bytes {
     match (v) {
-        Asn1.Bool(b) => tlv(TAG_BOOLEAN, bytes_of([if (b) { 0xff } else { 0 }])),
+        Asn1.Bool(b) => tlv(TAG_BOOLEAN, bytes_of([if (b) { 0xFF } else { 0 }])),
         Asn1.Int(c) => tlv(TAG_INTEGER, c),
         Asn1.BitStr(c) => tlv(TAG_BIT_STRING, bytes_concat([bytes_of([0]), c])),
         Asn1.OctStr(c) => tlv(TAG_OCTET_STRING, c),
@@ -124,19 +138,19 @@ pub fn encode(v: Asn1) -> bytes {
         Asn1.Time(ms) => encode_time(ms),
         Asn1.Seq(items) => seq_of(items),
         Asn1.Set(items) => set_of(items),
-        Asn1.Explicit(n, inner) => tlv(0xa0 | n, encode(inner)),
+        Asn1.Explicit(n, inner) => tlv(0xA0 | n, encode(inner)),
         Asn1.Implicit(n, c) => tlv(0x80 | n, c),
-        Asn1.ImplicitSeq(n, items) => tlv(0xa0 | n, concat_all(items)),
+        Asn1.ImplicitSeq(n, items) => tlv(0xA0 | n, concat_all(items)),
         Asn1.Raw(b) => b,
     }
 }
 
 /// The INTEGER content octets of a non-negative-or-negative `int` (minimal two's complement).
 pub fn int_content(n: int) -> bytes {
-    var octets: [int] = [n & 0xff];
+    var octets: [int] = [n & 0xFF];
     var rest = n >> 8;
     while (!((rest == 0 && (octets[0] & 0x80) == 0) || (rest == -1 && (octets[0] & 0x80) != 0))) {
-        octets.insert_at(0, rest & 0xff);
+        octets.insert_at(0, rest & 0xFF);
         rest = rest >> 8;
     }
     bytes_of(octets)
@@ -181,10 +195,10 @@ pub fn oid_encode(s: string) -> bytes {
     var all: [int] = [arcs[0] * 40 + arcs[1]];
     all = all + arcs.slice(2, arcs.len());
     for a in all {
-        var chunk: [int] = [a & 0x7f];
+        var chunk: [int] = [a & 0x7F];
         var rest = a >> 7;
         while (rest > 0) {
-            chunk.insert_at(0, (rest & 0x7f) | 0x80);
+            chunk.insert_at(0, (rest & 0x7F) | 0x80);
             rest = rest >> 7;
         }
         octets = octets + chunk;
@@ -216,7 +230,7 @@ pub fn read(b: bytes, off: int) -> Result<(Node, int), string> {
         return Result.Err("truncated DER at offset ${off}");
     }
     let tag = b[off];
-    if ((tag & 0x1f) == 0x1f) {
+    if ((tag & 0x1F) == 0x1F) {
         return Result.Err("high tag numbers are not supported (offset ${off})");
     }
     let first = b[off + 1];
@@ -227,7 +241,7 @@ pub fn read(b: bytes, off: int) -> Result<(Node, int), string> {
     } else if (first == 0x80) {
         return Result.Err("indefinite length is not DER (offset ${off})");
     } else {
-        let n = first & 0x7f;
+        let n = first & 0x7F;
         if (n > 4) {
             return Result.Err("length of ${n} octets is too large (offset ${off})");
         }
@@ -249,7 +263,9 @@ pub fn read(b: bytes, off: int) -> Result<(Node, int), string> {
     }
     let end = off + hdr + len;
     if (end > b.len()) {
-        return Result.Err("element at offset ${off} runs past the end (${len} > ${b.len() - off - hdr})");
+        return Result.Err(
+            "element at offset ${off} runs past the end (${len} > ${b.len() - off - hdr})"
+        );
     }
     let node = Node { tag: tag, body: b.sub_bytes(off + hdr, end), raw: b.sub_bytes(off, end) };
     Result.Ok((node, end))
@@ -319,7 +335,7 @@ pub fn oid_decode(c: bytes) -> Result<string, string> {
         if (acc > (1 << 48)) {
             return Result.Err("OID arc too large");
         }
-        acc = (acc << 7) | (o & 0x7f);
+        acc = (acc << 7) | (o & 0x7F);
         if ((o & 0x80) == 0) {
             if (first) {
                 let a = if (acc < 40) { 0 } else if (acc < 80) { 1 } else { 2 };
@@ -462,7 +478,7 @@ pub fn as_time(n: Node) -> Result<int, string> {
         hour: hour,
         minute: minute,
         second: second,
-        weekday: 0,
+        weekday: 0
     };
     Result.Ok(time.to_epoch_millis(dt))
 }
@@ -513,7 +529,9 @@ fn preview(n: Node) -> string {
         }
         return "(${n.body.len() * 8} bits)";
     }
-    if ([TAG_UTF8, TAG_PRINTABLE, TAG_IA5, TAG_UTC_TIME, TAG_GEN_TIME, TAG_T61, TAG_BMP].contains(n.tag)) {
+    if ([TAG_UTF8, TAG_PRINTABLE, TAG_IA5, TAG_UTC_TIME, TAG_GEN_TIME, TAG_T61, TAG_BMP].contains(
+        n.tag
+    )) {
         return "'${as_text(n).unwrap_or("?")}'";
     }
     if (n.tag == TAG_BOOLEAN) {
@@ -530,18 +548,18 @@ pub fn tag_name(tag: int) -> string {
         0x04 => "OCTET STRING",
         0x05 => "NULL",
         0x06 => "OID",
-        0x0c => "UTF8String",
+        0x0C => "UTF8String",
         0x13 => "PrintableString",
         0x14 => "T61String",
         0x16 => "IA5String",
         0x17 => "UTCTime",
         0x18 => "GeneralizedTime",
-        0x1e => "BMPString",
+        0x1E => "BMPString",
         0x30 => "SEQUENCE",
         0x31 => "SET",
         _ => {
-            if ((tag & 0xc0) == 0x80) {
-                "[${tag & 0x1f}]"
+            if ((tag & 0xC0) == 0x80) {
+                "[${tag & 0x1F}]"
             } else {
                 "tag 0x${hex2(tag)}"
             }

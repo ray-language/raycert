@@ -104,7 +104,9 @@ fn cmd_inspect(a: Args) -> Result<int, string> {
     match (ops.split_host_port(target)) {
         Option.Some((host, port)) => {
             certs = ops.remote_chain(host, port)?;
-            print("${host}:${port} presented ${certs.len()} certificate(s) (TLS 1.2 handshake, read by hand)");
+            print(
+                "${host}:${port} presented ${certs.len()} certificate(s) (TLS 1.2 handshake, read by hand)"
+            );
             anchors = ops.system_anchors();
         },
         Option.None => {
@@ -135,7 +137,7 @@ fn cmd_inspect(a: Args) -> Result<int, string> {
     for l in links {
         match (l.check) {
             verify.Check.Invalid(_) => return Result.Ok(2),
-            _ => {},
+            _ => { },
         }
     }
     Result.Ok(0)
@@ -208,10 +210,12 @@ fn cmd_ca(a: Args) -> Result<int, string> {
                 subject: cli.value(a, "subject", "CN=raycert development CA,O=raycert"),
                 days: cli.int_value(a, "days", 3650)?,
                 keychain_service: cli.value(a, "keychain", ""),
-                force: cli.has(a, "force"),
+                force: cli.has(a, "force")
             };
             let c = ops.ca_init(home, o, time.now())?;
-            print("CA created in ${store.ca_dir(home)} (key: ${store.key_ref_text(store.ca_key_ref(home)?)})");
+            print(
+                "CA created in ${store.ca_dir(home)} (key: ${store.key_ref_text(store.ca_key_ref(home)?)})"
+            );
             for line in report.describe(c, time.now()) {
                 print(line);
             }
@@ -243,16 +247,18 @@ fn cmd_ca(a: Args) -> Result<int, string> {
 
 fn meta_from(a: Args, name: string, source: string) -> Result<store.Meta, string> {
     store.check_name(name)?;
-    Result.Ok(store.Meta {
-        name: name,
-        source: source,
-        names: cli.list(a, "san"),
-        key_kind: keys.kind_name(keys.parse_kind(cli.value(a, "type", "p256"))?),
-        days: cli.int_value(a, "days", 90)?,
-        directory: cli.value(a, "directory", ""),
-        http_port: cli.int_value(a, "http-port", 80)?,
-        http_host: cli.value(a, "http-host", "::"),
-    })
+    Result.Ok(
+        store.Meta {
+            name: name,
+            source: source,
+            names: cli.list(a, "san"),
+            key_kind: keys.kind_name(keys.parse_kind(cli.value(a, "type", "p256"))?),
+            days: cli.int_value(a, "days", 90)?,
+            directory: cli.value(a, "directory", ""),
+            http_port: cli.int_value(a, "http-port", 80)?,
+            http_host: cli.value(a, "http-host", "::")
+        }
+    )
 }
 
 fn cmd_issue(a: Args) -> Result<int, string> {
@@ -284,17 +290,43 @@ fn show_issued(name: string, dir: string) -> Result<int, string> {
 }
 
 fn cmd_acme(a: Args) -> Result<int, string> {
-    only_flags(a, ["directory", "san", "email", "http-port", "http-host", "type", "insecure", "verbose", "days"])?;
+    only_flags(
+        a,
+        [
+            "directory",
+            "san",
+            "email",
+            "http-port",
+            "http-host",
+            "type",
+            "insecure",
+            "verbose",
+            "days"
+        ]
+    )?;
     let home = home_of(a);
     let name = one_positional(a, "NAME")?;
     let m = meta_from(a, name, "acme")?;
     if (m.directory == "") {
-        return Result.Err("--directory URL is required (e.g. https://localhost:14000/dir for Pebble)");
+        return Result.Err(
+            "--directory URL is required (e.g. https://localhost:14000/dir for Pebble)"
+        );
     }
     if (m.names.len() == 0) {
         return Result.Err("--san is required");
     }
-    let dir = ops.issue_acme(home, m, cli.value(a, "email", ""), cli.has(a, "insecure"), cli.has(a, "verbose"))?;
+    if (m.key_kind == "ed25519") {
+        return Result.Err(
+            "ACME CAs (Let's Encrypt, Pebble) take only RSA and ECDSA keys: use --type p256 or rsa"
+        );
+    }
+    let dir = ops.issue_acme(
+        home,
+        m,
+        cli.value(a, "email", ""),
+        cli.has(a, "insecure"),
+        cli.has(a, "verbose")
+    )?;
     show_issued(name, dir)
 }
 
@@ -318,7 +350,16 @@ fn cmd_renew(a: Args) -> Result<int, string> {
     only_flags(a, ["within", "force", "hook", "insecure", "verbose"])?;
     let home = home_of(a);
     let within = cli.int_value(a, "within", 30)?;
-    let results = ops.renew(home, a.positional, within, cli.has(a, "force"), cli.value(a, "hook", ""), cli.has(a, "insecure"), cli.has(a, "verbose"), time.now())?;
+    let results = ops.renew(
+        home,
+        a.positional,
+        within,
+        cli.has(a, "force"),
+        cli.value(a, "hook", ""),
+        cli.has(a, "insecure"),
+        cli.has(a, "verbose"),
+        time.now()
+    )?;
     var failed = 0;
     for r in results {
         let err = if (r.error != "") { ": ${r.error}" } else { "" };

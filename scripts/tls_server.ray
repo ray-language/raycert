@@ -1,0 +1,40 @@
+//! A TLS server on raylang's own stack (net/webserver + rustls) loading raycert's files, for the
+//! interop script: `ray run scripts/tls_server.ray CERT_CHAIN KEY PORT_FILE`. It listens on an
+//! ephemeral port, writes the port to PORT_FILE and serves `hello from raylang tls` until stdin
+//! closes or 30 s pass.
+
+import net/webserver;
+import std/fs;
+import std/net;
+import std/time;
+
+fn main() -> int {
+    let a = args();
+    if (a.len() != 3) {
+        eprint("usage: tls_server.ray CHAIN KEY PORT_FILE");
+        return 64;
+    }
+    let chain = fs.read_file(a[0]).unwrap();
+    let key = fs.read_file(a[1]).unwrap();
+    let listener = net.tcp_listen("127.0.0.1", 0).unwrap();
+    fs.write_file(a[2], "${net.local_port(listener)}").unwrap();
+    let stop: Channel<int> = Channel.new();
+    spawn(fn() {
+        time.sleep(30000);
+        close(stop);
+    });
+    let opts = webserver.options().with_tls(chain, key).with_stop(stop).quiet();
+    match (webserver.serve_options_on(
+        listener,
+        opts,
+        fn() -> fn(webserver.Request) -> webserver.Response {
+            fn(req: webserver.Request) -> webserver.Response { webserver.text(200, "hello from raylang tls\n") }
+        }
+    )) {
+        Result.Ok(_) => 0,
+        Result.Err(e) => {
+            eprint("tls_server: ${e}");
+            1
+        },
+    }
+}

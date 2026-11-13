@@ -31,7 +31,9 @@ pub fn certs_of(raw: bytes) -> Result<[Cert], string> {
     for b in pem.decode_all(text)? {
         i = i + 1;
         if (b.label == "CERTIFICATE") {
-            out.push(x509.parse(b.der).map_err(fn(e: string) -> string { "PEM block ${i}: ${e}" })?);
+            out.push(
+                x509.parse(b.der).map_err(fn(e: string) -> string { "PEM block ${i}: ${e}" })?
+            );
         }
     }
     if (out.len() == 0) {
@@ -65,11 +67,15 @@ pub fn remote_chain(host: string, port: int) -> Result<[Cert], string> {
 
 /// The system trust store, when there is one at a known place (used as chain anchors).
 pub fn system_anchors() -> [Cert] {
-    for p in [env("SSL_CERT_FILE").unwrap_or(""), "/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"] {
+    for p in [
+        env("SSL_CERT_FILE").unwrap_or(""),
+        "/etc/ssl/cert.pem",
+        "/etc/ssl/certs/ca-certificates.crt"
+    ] {
         if (p != "" && fs.exists(p)) {
             match (load_certs(p)) {
                 Result.Ok(cs) => return cs,
-                Result.Err(_) => {},
+                Result.Err(_) => { },
             }
         }
     }
@@ -141,7 +147,12 @@ pub fn ca_remove(home: string) -> Result<int, string> {
 // ---------------------------------------------------------------- issuing
 
 /// Issues (or re-issues) `m.name` from the local CA, or from a CSR's key when `csr` is given.
-pub fn issue_local(home: string, m: Meta, csr_der: Option<bytes>, now: int) -> Result<string, string> {
+pub fn issue_local(
+    home: string,
+    m: Meta,
+    csr_der: Option<bytes>,
+    now: int
+) -> Result<string, string> {
     let (ca_key, ca) = load_ca(home)?;
     var names = m.names;
     match (csr_der) {
@@ -152,13 +163,20 @@ pub fn issue_local(home: string, m: Meta, csr_der: Option<bytes>, now: int) -> R
             }
             if (names.len() == 0) {
                 for n in c.names {
-                    names.push(n.strip_prefix("DNS:").unwrap_or(n.strip_prefix("IP:").unwrap_or(n)));
+                    names.push(n
+                        .strip_prefix("DNS:")
+                        .unwrap_or(n.strip_prefix("IP:").unwrap_or(n)));
                 }
             }
             if (names.len() == 0) {
                 return Result.Err("no names: pass --san or a CSR with a subjectAltName");
             }
-            let req = issue.LeafRequest { subject: x509.cn_name(names[0]), spki: c.spki.raw, names: names, days: m.days };
+            let req = issue.LeafRequest {
+                subject: x509.cn_name(names[0]),
+                spki: c.spki.raw,
+                names: names,
+                days: m.days
+            };
             let leaf = issue.leaf(req, ca_key, ca, now)?;
             let dir = store.cert_dir(home, m.name);
             fs.mkdir("${home}/certs")?;
@@ -172,13 +190,18 @@ pub fn issue_local(home: string, m: Meta, csr_der: Option<bytes>, now: int) -> R
             store.write_atomic("${dir}/meta.json", store.meta_json(m2) + "\n", false)?;
             return Result.Ok(dir);
         },
-        Option.None => {},
+        Option.None => { },
     }
     if (names.len() == 0) {
         return Result.Err("no names: pass --san");
     }
     let key = keys.generate(keys.parse_kind(m.key_kind)?)?;
-    let req = issue.LeafRequest { subject: x509.cn_name(names[0]), spki: keys.spki_der(key)?, names: names, days: m.days };
+    let req = issue.LeafRequest {
+        subject: x509.cn_name(names[0]),
+        spki: keys.spki_der(key)?,
+        names: names,
+        days: m.days
+    };
     let leaf = issue.leaf(req, ca_key, ca, now)?;
     store.save_issued(home, m, key, [leaf, ca.raw])
 }
@@ -196,7 +219,13 @@ pub fn acme_account_key(home: string) -> Result<PrivKey, string> {
     Result.Ok(k)
 }
 
-pub fn issue_acme(home: string, m: Meta, email: string, insecure: bool, verbose: bool) -> Result<string, string> {
+pub fn issue_acme(
+    home: string,
+    m: Meta,
+    email: string,
+    insecure: bool,
+    verbose: bool
+) -> Result<string, string> {
     let account = acme_account_key(home)?;
     let key = keys.generate(keys.parse_kind(m.key_kind)?)?;
     let p = obtain.Params {
@@ -207,7 +236,7 @@ pub fn issue_acme(home: string, m: Meta, email: string, insecure: bool, verbose:
         http_port: m.http_port,
         insecure: insecure,
         verbose: verbose,
-        timeout_ms: 60000,
+        timeout_ms: 60000
     };
     let chain = obtain.obtain(p, account, key)?;
     store.save_issued(home, m, key, chain)
@@ -224,9 +253,20 @@ pub struct RenewResult {
 
 /// Re-issues every stored certificate with fewer than `within` days left (or all with `force`),
 /// then runs `hook` once per renewed certificate.
-pub fn renew(home: string, only: [string], within: int, force: bool, hook: string, insecure: bool, verbose: bool, now: int) -> Result<[RenewResult], string> {
+pub fn renew(
+    home: string,
+    only: [string],
+    within: int,
+    force: bool,
+    hook: string,
+    insecure: bool,
+    verbose: bool,
+    now: int
+) -> Result<[RenewResult], string> {
     var out: [RenewResult] = [];
-    for name in store.list_issued(home)? {
+    for name in store.list_issued(
+        home
+    )? {
         if (only.len() > 0 && !only.contains(name)) {
             continue;
         }
@@ -254,7 +294,14 @@ pub fn renew(home: string, only: [string], within: int, force: bool, hook: strin
                     match (run_hook(hook, name, dir)) {
                         Result.Ok(_) => action = "renewed + hook",
                         Result.Err(e) => {
-                            out.push(RenewResult { name: name, days_left: left, action: "renewed", error: "hook: ${e}" });
+                            out.push(
+                                RenewResult {
+                                    name: name,
+                                    days_left: left,
+                                    action: "renewed",
+                                    error: "hook: ${e}"
+                                }
+                            );
                             continue;
                         },
                     }

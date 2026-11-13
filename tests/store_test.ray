@@ -37,7 +37,7 @@ fn meta_round_trips() {
         days: 30,
         directory: "https://localhost:14000/dir",
         http_port: 5002,
-        http_host: "::",
+        http_host: "::"
     };
     let back = store.parse_meta(store.meta_json(m)).unwrap();
     assert_eq(back.names, ["a.test", "b.test"]);
@@ -50,21 +50,37 @@ fn meta_round_trips() {
 }
 
 fn local_meta(name: string, names: [string], days: int) -> store.Meta {
-    store.Meta { name: name, source: "local", names: names, key_kind: "p256", days: days, directory: "", http_port: 0, http_host: "" }
+    store.Meta {
+        name: name,
+        source: "local",
+        names: names,
+        key_kind: "p256",
+        days: days,
+        directory: "",
+        http_port: 0,
+        http_host: ""
+    }
 }
 
 @test
 fn ca_issue_list_and_renew_with_a_hook() {
     let home = temp_home();
     let now = time.now();
-    let o = ops.CaOptions { kind: KeyKind.P256, subject: "CN=Test CA", days: 365, keychain_service: "", force: false };
+    let o = ops.CaOptions {
+        kind: KeyKind.P256,
+        subject: "CN=Test CA",
+        days: 365,
+        keychain_service: "",
+        force: false
+    };
     let ca = ops.ca_init(home, o, now).unwrap();
     assert(ops.ca_init(home, o, now).is_err());
     assert_eq(store.mode_of("${home}/ca/key.pem").unwrap(), 0o600);
     assert_eq(store.mode_of("${home}/ca").unwrap(), 0o700);
 
     ops.issue_local(home, local_meta("short", ["short.test"], 5), Option.None, now).unwrap();
-    ops.issue_local(home, local_meta("long", ["long.test", "127.0.0.1"], 200), Option.None, now).unwrap();
+    ops.issue_local(home, local_meta("long", ["long.test", "127.0.0.1"], 200), Option.None, now)
+        .unwrap();
     assert_eq(store.list_issued(home).unwrap(), ["long", "short"]);
     assert_eq(store.mode_of("${home}/certs/short/key.pem").unwrap(), 0o600);
     let chain = ops.load_certs("${home}/certs/short/chain.pem").unwrap();
@@ -97,7 +113,14 @@ fn ca_issue_list_and_renew_with_a_hook() {
 fn a_csr_is_signed_without_seeing_its_key() {
     let home = temp_home();
     let now = time.now();
-    ops.ca_init(home, ops.CaOptions { kind: KeyKind.Ed25519, subject: "CN=CSR CA", days: 30, keychain_service: "", force: false }, now).unwrap();
+    ops.ca_init(home, ops.CaOptions {
+        kind: KeyKind.Ed25519,
+        subject: "CN=CSR CA",
+        days: 30,
+        keychain_service: "",
+        force: false
+    }, now)
+        .unwrap();
     let k = keys.generate(KeyKind.Rsa(2048)).unwrap();
     let csr = issue.csr(k, ["csr.test"]).unwrap();
     let dir = ops.issue_local(home, local_meta("ext", [], 10), Option.Some(csr), now).unwrap();
@@ -118,7 +141,14 @@ fn the_ca_key_can_live_in_the_keychain() {
     let home = temp_home();
     let service = "raycert-test-${hex.hex_encode(crypto.random_bytes(4))}";
     let now = time.now();
-    ops.ca_init(home, ops.CaOptions { kind: KeyKind.P256, subject: "CN=Keychain CA", days: 30, keychain_service: service, force: false }, now).unwrap();
+    ops.ca_init(home, ops.CaOptions {
+        kind: KeyKind.P256,
+        subject: "CN=Keychain CA",
+        days: 30,
+        keychain_service: service,
+        force: false
+    }, now)
+        .unwrap();
     assert(!fs.exists("${home}/ca/key.pem"));
     match (store.ca_key_ref(home).unwrap()) {
         store.KeyRef.Keychain(s, _) => assert_eq(s, service),
@@ -133,7 +163,19 @@ fn the_ca_key_can_live_in_the_keychain() {
 
 @test
 fn arguments_parse_flags_lists_and_switches() {
-    let a = cli.parse(["web", "--san", "a.test,b.test", "--san=c.test", "--days", "7", "--force", "-o", "out.pem", "-v"], ["force", "verbose"]).unwrap();
+    let a = cli.parse([
+        "web",
+        "--san",
+        "a.test,b.test",
+        "--san=c.test",
+        "--days",
+        "7",
+        "--force",
+        "-o",
+        "out.pem",
+        "-v"
+    ], ["force", "verbose"])
+        .unwrap();
     assert_eq(a.positional, ["web"]);
     assert_eq(cli.list(a, "san"), ["a.test", "b.test", "c.test"]);
     assert_eq(cli.int_value(a, "days", 90).unwrap(), 7);

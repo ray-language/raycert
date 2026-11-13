@@ -24,8 +24,14 @@ pub struct Params {
 
 /// The http-01 responder: GET /.well-known/acme-challenge/<token> → the key authorization.
 /// `tokens` holds token → key authorization; the server stops when `stop` is closed.
-pub fn serve_challenges(listener: int, tokens: Map<string, string>, stop: Channel<int>) -> Result<int, string> {
-    webserver.serve_options_on(listener, webserver.options().with_stop(stop).quiet(), fn() -> fn(webserver.Request) -> webserver.Response {
+pub fn serve_challenges(
+    listener: int,
+    tokens: Map<string, string>,
+    stop: Channel<int>
+) -> Result<int, string> {
+    webserver.serve_options_on(listener, webserver.options()
+        .with_stop(stop)
+        .quiet(), fn() -> fn(webserver.Request) -> webserver.Response {
         let table = tokens;
         fn(req: webserver.Request) -> webserver.Response {
             let prefix = "/.well-known/acme-challenge/";
@@ -45,7 +51,11 @@ pub fn serve_challenges(listener: int, tokens: Map<string, string>, stop: Channe
     })
 }
 
-fn wait_status(label: string, timeout_ms: int, poll: fn() -> Result<(string, string), string>) -> Result<string, string> {
+fn wait_status(
+    label: string,
+    timeout_ms: int,
+    poll: fn() -> Result<(string, string), string>
+) -> Result<string, string> {
     let deadline = time.monotonic_millis() + timeout_ms;
     var pause = 250;
     while (true) {
@@ -131,7 +141,12 @@ pub fn obtain(p: Params, account_key: PrivKey, cert_key: PrivKey) -> Result<[byt
     Result.Ok(out)
 }
 
-fn answer(c: acme.Client, pending: [acme.Challenge], urls: [string], timeout_ms: int) -> Result<int, string> {
+fn answer(
+    c: acme.Client,
+    pending: [acme.Challenge],
+    urls: [string],
+    timeout_ms: int
+) -> Result<int, string> {
     for ch in pending {
         acme.respond(c, ch)?;
     }

@@ -32,7 +32,7 @@ impl DerEncode for Tbs {
             Asn1.Raw(self.issuer.to_der()),
             Asn1.Seq([Asn1.Time(self.not_before), Asn1.Time(self.not_after)]),
             Asn1.Raw(self.subject.to_der()),
-            Asn1.Raw(self.spki),
+            Asn1.Raw(self.spki)
         ];
         if (self.exts.len() > 0) {
             items.push(Asn1.Explicit(3, Asn1.Raw(der.seq_of(self.exts))));
@@ -46,7 +46,11 @@ impl DerEncode for Tbs {
 pub fn sign_envelope<T: DerEncode>(body: T, key: PrivKey) -> Result<bytes, string> {
     let tbs = body.to_der();
     let sig = keys.sign_x509(key, tbs)?;
-    Result.Ok(der.encode(Asn1.Seq([Asn1.Raw(tbs), Asn1.Raw(keys.sig_alg(key).to_der()), Asn1.BitStr(sig)])))
+    Result.Ok(
+        der.encode(
+            Asn1.Seq([Asn1.Raw(tbs), Asn1.Raw(keys.sig_alg(key).to_der()), Asn1.BitStr(sig)])
+        )
+    )
 }
 
 /// A positive 127-bit random serial (RFC 5280 allows up to 20 octets; CAs use ≥ 64 random bits).
@@ -56,7 +60,7 @@ pub fn random_serial() -> bytes {
     for o in r {
         octets.push(o);
     }
-    octets[0] = (octets[0] & 0x7f) | 0x01;
+    octets[0] = (octets[0] & 0x7F) | 0x01;
     bytes_of(octets)
 }
 
@@ -117,7 +121,9 @@ pub fn subject_alt_name(names: [string]) -> Result<Ext, string> {
             },
         }
     }
-    Result.Ok(Ext { oid: oid.SUBJECT_ALT_NAME, critical: false, value: der.encode(Asn1.Seq(items)) })
+    Result.Ok(
+        Ext { oid: oid.SUBJECT_ALT_NAME, critical: false, value: der.encode(Asn1.Seq(items)) }
+    )
 }
 
 pub fn check_dns_name(n: string) -> Result<int, string> {
@@ -128,11 +134,17 @@ pub fn check_dns_name(n: string) -> Result<int, string> {
     for label in n.split(".") {
         let ok_wild = first && label == "*";
         if (!ok_wild) {
-            if (label.len() == 0 || label.len() > 63 || label.starts_with("-") || label.ends_with("-")) {
+            if (label.len() == 0
+                || label.len() > 63
+                || label.starts_with("-")
+                || label.ends_with("-")) {
                 return Result.Err("'${n}' is not a DNS name");
             }
             for c in label.chars() {
-                let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-';
+                let ok = (c >= 'a' && c <= 'z')
+                    || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9')
+                    || c == '-';
                 if (!ok) {
                     return Result.Err("'${n}' is not a DNS name (character '${c}')");
                 }
@@ -195,7 +207,7 @@ fn parse_ipv6(s: string) -> Option<bytes> {
     var out: [int] = [];
     for g in all {
         out.push(g >> 8);
-        out.push(g & 0xff);
+        out.push(g & 0xFF);
     }
     Option.Some(bytes_of(out))
 }
@@ -230,7 +242,11 @@ pub fn subject_key_id(id: bytes) -> Ext {
 }
 
 pub fn authority_key_id(id: bytes) -> Ext {
-    Ext { oid: oid.AUTHORITY_KEY_ID, critical: false, value: der.encode(Asn1.Seq([Asn1.Implicit(0, id)])) }
+    Ext {
+        oid: oid.AUTHORITY_KEY_ID,
+        critical: false,
+        value: der.encode(Asn1.Seq([Asn1.Implicit(0, id)]))
+    }
 }
 
 // ---------------------------------------------------------------- certificates
@@ -247,7 +263,7 @@ pub fn self_signed_ca(key: PrivKey, subject: Name, now: int, days: int) -> Resul
         not_after: now + days * 86400000,
         subject: subject,
         spki: spki,
-        exts: [basic_constraints(true, 0), key_usage([0, 5, 6]), subject_key_id(id)],
+        exts: [basic_constraints(true, 0), key_usage([0, 5, 6]), subject_key_id(id)]
     };
     sign_envelope(tbs, key)
 }
@@ -265,7 +281,11 @@ pub fn leaf(req: LeafRequest, ca_key: PrivKey, ca: x509.Cert, now: int) -> Resul
     let spki_node = x509.parse_spki(der.parse(req.spki)?)?;
     // keyEncipherment only makes sense for RSA keys (TLS 1.2 RSA key exchange).
     let usage = if (spki_node.alg == oid.RSA_ENCRYPTION) { [0, 2] } else { [0] };
-    var exts: [Ext] = [basic_constraints(false, -1), key_usage(usage), ext_key_usage([oid.SERVER_AUTH, oid.CLIENT_AUTH])];
+    var exts: [Ext] = [
+        basic_constraints(false, -1),
+        key_usage(usage),
+        ext_key_usage([oid.SERVER_AUTH, oid.CLIENT_AUTH])
+    ];
     if (req.names.len() > 0) {
         exts.push(subject_alt_name(req.names)?);
     }
@@ -287,7 +307,7 @@ pub fn leaf(req: LeafRequest, ca_key: PrivKey, ca: x509.Cert, now: int) -> Resul
         not_after: not_after,
         subject: req.subject,
         spki: req.spki,
-        exts: exts,
+        exts: exts
     };
     sign_envelope(tbs, ca_key)
 }
@@ -304,14 +324,20 @@ impl DerEncode for RequestInfo {
     fn to_der(self) -> bytes {
         var attrs: [Asn1] = [];
         if (self.exts.len() > 0) {
-            attrs.push(Asn1.Seq([Asn1.Oid(oid.EXTENSION_REQUEST), Asn1.Set([Asn1.Raw(der.seq_of(self.exts))])]));
+            attrs.push(
+                Asn1.Seq([Asn1.Oid(oid.EXTENSION_REQUEST), Asn1.Set([Asn1.Raw(der.seq_of(self.exts))])])
+            );
         }
-        der.encode(Asn1.Seq([
-            der.int_of(0),
-            Asn1.Raw(self.subject.to_der()),
-            Asn1.Raw(self.spki),
-            Asn1.ImplicitSeq(0, attrs),
-        ]))
+        der.encode(
+            Asn1.Seq(
+                [
+                    der.int_of(0),
+                    Asn1.Raw(self.subject.to_der()),
+                    Asn1.Raw(self.spki),
+                    Asn1.ImplicitSeq(0, attrs)
+                ]
+            )
+        )
     }
 }
 
@@ -323,7 +349,7 @@ pub fn csr(key: PrivKey, names: [string]) -> Result<bytes, string> {
     let info = RequestInfo {
         subject: x509.cn_name(names[0]),
         spki: keys.spki_der(key)?,
-        exts: [subject_alt_name(names)?],
+        exts: [subject_alt_name(names)?]
     };
     sign_envelope(info, key)
 }
@@ -348,7 +374,7 @@ pub fn parse_csr(b: bytes) -> Result<Csr, string> {
     let subject = x509.parse_name(info[1])?;
     let spki = x509.parse_spki(info[2])?;
     var names: [string] = [];
-    if (info.len() > 3 && info[3].tag == 0xa0) {
+    if (info.len() > 3 && info[3].tag == 0xA0) {
         for attr in der.children(info[3])? {
             let kv = der.expect(attr, der.TAG_SEQUENCE, "Attribute")?;
             if (kv.len() == 2 && der.as_oid(kv[0])? == oid.EXTENSION_REQUEST) {

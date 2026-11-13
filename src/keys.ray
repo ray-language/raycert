@@ -53,11 +53,15 @@ pub fn generate(k: KeyKind) -> Result<PrivKey, string> {
 /// std/crypto takes an Ed25519 key as its raw 32-octet seed, not as PKCS#8: we wrap and unwrap
 /// the RFC 8410 envelope ourselves so the files look like `openssl genpkey -algorithm ed25519`.
 pub fn ed25519_pkcs8(seed: bytes) -> bytes {
-    der.encode(Asn1.Seq([
-        der.int_of(0),
-        Asn1.Seq([Asn1.Oid(oid.ED25519)]),
-        Asn1.OctStr(der.encode(Asn1.OctStr(seed))),
-    ]))
+    der.encode(
+        Asn1.Seq(
+            [
+                der.int_of(0),
+                Asn1.Seq([Asn1.Oid(oid.ED25519)]),
+                Asn1.OctStr(der.encode(Asn1.OctStr(seed)))
+            ]
+        )
+    )
 }
 
 /// The algorithm OID (and curve, for EC) inside a PKCS#8 PrivateKeyInfo.
@@ -107,7 +111,9 @@ pub fn from_pem(text: string) -> Result<PrivKey, string> {
             return from_pkcs8(b.der);
         }
         if (b.label == "EC PRIVATE KEY" || b.label == "RSA PRIVATE KEY") {
-            return Result.Err("${b.label} is the legacy form; convert it with `openssl pkcs8 -topk8 -nocrypt`");
+            return Result.Err(
+                "${b.label} is the legacy form; convert it with `openssl pkcs8 -topk8 -nocrypt`"
+            );
         }
         if (b.label == "ENCRYPTED PRIVATE KEY") {
             return Result.Err("encrypted private keys are not supported");
@@ -182,7 +188,9 @@ pub fn sign_jws(k: PrivKey, msg: bytes) -> Result<bytes, string> {
 /// `r || s` (64 octets) → DER `SEQUENCE { INTEGER r, INTEGER s }`.
 pub fn ecdsa_der(rs: bytes) -> bytes {
     let half = rs.len() / 2;
-    der.encode(Asn1.Seq([der.uint_of(rs.sub_bytes(0, half)), der.uint_of(rs.sub_bytes(half, rs.len()))]))
+    der.encode(
+        Asn1.Seq([der.uint_of(rs.sub_bytes(0, half)), der.uint_of(rs.sub_bytes(half, rs.len()))])
+    )
 }
 
 /// DER `SEQUENCE { r, s }` → fixed `r || s` of `size` octets each.
