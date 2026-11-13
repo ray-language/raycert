@@ -1,0 +1,240 @@
+//! An ACME client (RFC 8555): directory, nonces, account, order, http-01 challenge, finalize
+//! with a CSR, and the certificate chain. Every request is a JWS (`jws.ray`).
+
+import jws;
+import net/http;
+import std/json;
+from keys import PrivKey;
+from std/base64 import base64url;
+from std/json import Json;
+
+pub struct Client {
+    key: PrivKey,
+    new_nonce: string,
+    new_account: string,
+    new_order: string,
+    kid: string,
+    nonce: string,
+    insecure: bool,
+    verbose: bool,
+}
+
+pub struct Order {
+    url: string,
+    status: string,
+    authorizations: [string],
+    finalize: string,
+    certificate: string,
+    problem: string,
+}
+
+pub struct Challenge {
+    kind: string,
+    url: string,
+    token: string,
+    status: string,
+}
+
+pub struct Authz {
+    identifier: string,
+    status: string,
+    challenges: [Challenge],
+    problem: string,
+}
+
+fn opts(c: Client) -> http.Options {
+    var o = http.options();
+    o.insecure_skip_verify = c.insecure;
+    o
+}
+
+fn trace(c: Client, line: string) {
+    if (c.verbose) {
+        eprint("acme: ${line}");
+    }
+}
+
+/// Reads the directory. `insecure` skips TLS verification (Pebble's own test CA); prefer
+/// `SSL_CERT_FILE=pebble.minica.pem`, which keeps it on.
+pub fn connect(directory: string, key: PrivKey, insecure: bool, verbose: bool) -> Result<Client, string> {
+    var o = http.options();
+    o.insecure_skip_verify = insecure;
+    let r = http.request_opts("GET", directory, bytes_of([]), [], o)?;
+    if (r.status != 200) {
+        return Result.Err("directory ${directory}: HTTP ${r.status}");
+    }
+    let j = json.parse(from_utf8(r.body)?)?;
+    let get = fn(k: string) -> Result<string, string> { json.get_string(j, k).ok_or("directory has no ${k}") };
+    Result.Ok(Client {
+        key: key,
+        new_nonce: get("newNonce")?,
+        new_account: get("newAccount")?,
+        new_order: get("newOrder")?,
+        kid: "",
+        nonce: "",
+        insecure: insecure,
+        verbose: verbose,
+    })
+}
+
+fn fresh_nonce(c: Client) -> Result<string, string> {
+    let r = http.request_opts("HEAD", c.new_nonce, bytes_of([]), [], opts(c))?;
+    http.header(r, "Replay-Nonce").ok_or("newNonce answered HTTP ${r.status} without Replay-Nonce")
+}
+
+/// The `type` and `detail` of an RFC 7807 problem document.
+pub fn problem_text(body: bytes) -> string {
+    match (from_utf8(body)) {
+        Result.Ok(text) => {
+            match (json.parse(text)) {
+                Result.Ok(j) => {
+                    let t = json.get_string(j, "type").unwrap_or("?");
+                    let d = json.get_string(j, "detail").unwrap_or("");
+                    "${t.strip_prefix("urn:ietf:params:acme:error:").unwrap_or(t)}: ${d}"
+                },
+                Result.Err(_) => text,
+            }
+        },
+        Result.Err(_) => "<${body.len()} octets>",
+    }
+}
+
+/// A signed POST. Retries once on `badNonce` (RFC 8555 §6.5: the server sends a new nonce with it).
+pub fn post(c: Client, url: string, payload: string) -> Result<http.Response, string> {
+    var attempt = 0;
+    while (true) {
+        let nonce = if (c.nonce != "") { c.nonce } else { fresh_nonce(c)? };
+        c.nonce = "";
+        let body = jws.sign(c.key, jws.protected(c.key, c.kid, nonce, url)?, payload)?;
+        let headers = [("Content-Type", "application/jose+json")];
+        let r = http.request_opts("POST", url, body.to_bytes(), headers, opts(c))?;
+        if let Option.Some(n) = http.header(r, "Replay-Nonce") {
+            c.nonce = n;
+        }
+        trace(c, "POST ${url} -> ${r.status}");
+        if (r.status < 400) {
+            return Result.Ok(r);
+        }
+        let p = problem_text(r.body);
+        if (p.starts_with("badNonce") && attempt == 0) {
+            attempt = attempt + 1;
+            continue;
+        }
+        return Result.Err("${url}: HTTP ${r.status} ${p}");
+    }
+}
+
+fn post_json(c: Client, url: string, payload: string) -> Result<Json, string> {
+    let r = post(c, url, payload)?;
+    json.parse(from_utf8(r.body)?)
+}
+
+/// Registers (or finds) the account of this key; sets and returns its URL (the `kid`).
+pub fn account(c: Client, email: string) -> Result<string, string> {
+    var payload = json.obj().field("termsOfServiceAgreed", true);
+    if (email != "") {
+        payload = payload.field("contact", json.list(["mailto:${email}"]));
+    }
+    c.kid = "";
+    let r = post(c, c.new_account, payload.render())?;
+    let kid = http.header(r, "Location").ok_or("newAccount answered without Location")?;
+    c.kid = kid;
+    Result.Ok(kid)
+}
+
+fn strings(j: Json, key: string) -> [string] {
+    var out: [string] = [];
+    for x in json.get_array(j, key).unwrap_or([]) {
+        if let Option.Some(s) = json.as_string(x) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+fn problem_of(j: Json) -> string {
+    match (json.member(j, "error")) {
+        Option.Some(e) => "${json.get_string(e, "type").unwrap_or("?")}: ${json.get_string(e, "detail").unwrap_or("")}",
+        Option.None => "",
+    }
+}
+
+pub fn order_of(url: string, j: Json) -> Order {
+    Order {
+        url: url,
+        status: json.get_string(j, "status").unwrap_or("?"),
+        authorizations: strings(j, "authorizations"),
+        finalize: json.get_string(j, "finalize").unwrap_or(""),
+        certificate: json.get_string(j, "certificate").unwrap_or(""),
+        problem: problem_of(j),
+    }
+}
+
+pub fn new_order(c: Client, names: [string]) -> Result<Order, string> {
+    var ids = json.arr();
+    for n in names {
+        ids = ids.item(json.obj().field("type", "dns").field("value", n));
+    }
+    let r = post(c, c.new_order, json.obj().field("identifiers", ids).render())?;
+    let url = http.header(r, "Location").ok_or("newOrder answered without Location")?;
+    Result.Ok(order_of(url, json.parse(from_utf8(r.body)?)?))
+}
+
+pub fn get_order(c: Client, url: string) -> Result<Order, string> {
+    Result.Ok(order_of(url, post_json(c, url, "")?))
+}
+
+pub fn authz_of(j: Json) -> Authz {
+    var chs: [Challenge] = [];
+    for ch in json.get_array(j, "challenges").unwrap_or([]) {
+        chs.push(Challenge {
+            kind: json.get_string(ch, "type").unwrap_or(""),
+            url: json.get_string(ch, "url").unwrap_or(""),
+            token: json.get_string(ch, "token").unwrap_or(""),
+            status: json.get_string(ch, "status").unwrap_or(""),
+        });
+    }
+    var problem = "";
+    for ch in json.get_array(j, "challenges").unwrap_or([]) {
+        let p = problem_of(ch);
+        if (p != "") {
+            problem = p;
+        }
+    }
+    let ident = match (json.member(j, "identifier")) {
+        Option.Some(i) => json.get_string(i, "value").unwrap_or("?"),
+        Option.None => "?",
+    };
+    Authz { identifier: ident, status: json.get_string(j, "status").unwrap_or("?"), challenges: chs, problem: problem }
+}
+
+pub fn get_authz(c: Client, url: string) -> Result<Authz, string> {
+    Result.Ok(authz_of(post_json(c, url, "")?))
+}
+
+pub fn http01(a: Authz) -> Option<Challenge> {
+    for ch in a.challenges {
+        if (ch.kind == "http-01") {
+            return Option.Some(ch);
+        }
+    }
+    Option.None
+}
+
+/// Tells the server the challenge is ready to be validated (payload `{}`).
+pub fn respond(c: Client, ch: Challenge) -> Result<int, string> {
+    post(c, ch.url, "{}")?;
+    Result.Ok(0)
+}
+
+pub fn finalize(c: Client, o: Order, csr_der: bytes) -> Result<Order, string> {
+    let payload = json.obj().field("csr", base64url(csr_der)).render();
+    let r = post(c, o.finalize, payload)?;
+    Result.Ok(order_of(o.url, json.parse(from_utf8(r.body)?)?))
+}
+
+/// The PEM chain (`application/pem-certificate-chain`).
+pub fn download(c: Client, url: string) -> Result<string, string> {
+    let r = post(c, url, "")?;
+    from_utf8(r.body)
+}

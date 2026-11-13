@@ -1,0 +1,331 @@
+//! raycert — inspect X.509 certificates, run a development CA, and obtain certificates over ACME.
+
+import cli;
+import issue;
+import keys;
+import ops;
+import report;
+import store;
+import verify;
+import x509;
+import std/fs;
+import std/pem;
+import std/qr;
+import std/time;
+from cli import Args;
+from x509 import Cert;
+
+const VERSION: string = "0.1.0";
+
+const USAGE: string = `raycert — certificates for the ray-apps ecosystem
+
+usage:
+  raycert inspect FILE|HOST:PORT [--ca FILE] [--qr]   certificates, chain checks, fingerprints
+  raycert der FILE                                     ASN.1 outline of any DER/PEM
+  raycert key new [--type T] [-o FILE]                 a PKCS#8 private key (0600)
+  raycert csr --key FILE --san NAMES [-o FILE]         a PKCS#10 request
+  raycert ca init [--type T] [--subject DN] [--days N] [--keychain SERVICE] [--force]
+  raycert ca show [--qr]                               the CA certificate and its fingerprint
+  raycert ca remove                                    delete the CA (and its keychain item)
+  raycert issue NAME --san NAMES [--type T] [--days N] [--csr FILE]
+  raycert acme NAME --directory URL --san NAMES [--email E] [--http-port P]
+               [--http-host H] [--type T] [--insecure] [-v]
+  raycert list                                         stored certificates and days left
+  raycert renew [NAME…] [--within DAYS] [--force] [--hook CMD] [--insecure] [-v]
+
+  --home DIR   the store (default $RAYCERT_HOME or ~/.raycert)
+  --type T     ed25519 | p256 (default) | rsa | rsa3072 | rsa4096
+  NAMES        comma-separated or repeated: --san example.test,127.0.0.1 --san ::1
+`;
+
+fn main() -> int {
+    let argv = args();
+    if (argv.len() == 0 || argv[0] == "help" || argv[0] == "--help" || argv[0] == "-h") {
+        print(USAGE);
+        return 0;
+    }
+    if (argv[0] == "version" || argv[0] == "--version") {
+        print("raycert ${VERSION}");
+        return 0;
+    }
+    let bools = ["qr", "force", "insecure", "verbose"];
+    let a = match (cli.parse(argv.slice(1, argv.len()), bools)) {
+        Result.Ok(a) => a,
+        Result.Err(e) => return fail(e),
+    };
+    let r = match (argv[0]) {
+        "inspect" => cmd_inspect(a),
+        "der" => cmd_der(a),
+        "key" => cmd_key(a),
+        "csr" => cmd_csr(a),
+        "ca" => cmd_ca(a),
+        "issue" => cmd_issue(a),
+        "acme" => cmd_acme(a),
+        "list" => cmd_list(a),
+        "renew" => cmd_renew(a),
+        other => Result.Err("unknown command '${other}' (raycert help)"),
+    };
+    match (r) {
+        Result.Ok(code) => code,
+        Result.Err(e) => fail(e),
+    }
+}
+
+fn fail(e: string) -> int {
+    eprint("raycert: ${e}");
+    1
+}
+
+fn home_of(a: Args) -> string {
+    cli.value(a, "home", store.default_home())
+}
+
+fn only_flags(a: Args, known: [string]) -> Result<int, string> {
+    match (cli.unknown(a, known + ["home"])) {
+        Option.Some(k) => Result.Err("unknown option --${k}"),
+        Option.None => Result.Ok(0),
+    }
+}
+
+fn one_positional(a: Args, what: string) -> Result<string, string> {
+    if (a.positional.len() != 1) {
+        return Result.Err("expected one ${what}");
+    }
+    Result.Ok(a.positional[0])
+}
+
+// ---------------------------------------------------------------- inspect / der
+
+fn cmd_inspect(a: Args) -> Result<int, string> {
+    only_flags(a, ["ca", "qr"])?;
+    let target = one_positional(a, "FILE or HOST:PORT")?;
+    var certs: [Cert] = [];
+    var anchors: [Cert] = [];
+    match (ops.split_host_port(target)) {
+        Option.Some((host, port)) => {
+            certs = ops.remote_chain(host, port)?;
+            print("${host}:${port} presented ${certs.len()} certificate(s) (TLS 1.2 handshake, read by hand)");
+            anchors = ops.system_anchors();
+        },
+        Option.None => {
+            certs = ops.load_certs(target)?;
+        },
+    }
+    let ca_file = cli.value(a, "ca", "");
+    if (ca_file != "") {
+        anchors = ops.load_certs(ca_file)?;
+    }
+    let now = time.now();
+    var i = 0;
+    for c in certs {
+        i = i + 1;
+        print("Certificate ${i} of ${certs.len()}");
+        for line in report.describe(c, now) {
+            print(line);
+        }
+    }
+    let links = verify.chain(certs, anchors);
+    print("Chain:");
+    for line in report.chain_lines(links) {
+        print(line);
+    }
+    if (cli.has(a, "qr")) {
+        print_qr("SHA256:${x509.fingerprint_sha256(certs[0])}")?;
+    }
+    for l in links {
+        match (l.check) {
+            verify.Check.Invalid(_) => return Result.Ok(2),
+            _ => {},
+        }
+    }
+    Result.Ok(0)
+}
+
+fn print_qr(text: string) -> Result<int, string> {
+    let code = qr.encode(text)?;
+    print(qr.to_text(code));
+    print(text);
+    Result.Ok(0)
+}
+
+fn cmd_der(a: Args) -> Result<int, string> {
+    only_flags(a, [])?;
+    let path = one_positional(a, "FILE")?;
+    let raw = fs.read_file_bytes(path)?;
+    if (raw.len() > 0 && raw[0] == 0x30) {
+        print(report.outline(raw)?);
+        return Result.Ok(0);
+    }
+    for b in pem.decode_all(from_utf8(raw)?)? {
+        print("-- ${b.label}");
+        print(report.outline(b.der)?);
+    }
+    Result.Ok(0)
+}
+
+// ---------------------------------------------------------------- keys and CSRs
+
+fn cmd_key(a: Args) -> Result<int, string> {
+    only_flags(a, ["type", "out"])?;
+    if (a.positional.len() != 1 || a.positional[0] != "new") {
+        return Result.Err("usage: raycert key new [--type T] [-o FILE]");
+    }
+    let k = keys.generate(keys.parse_kind(cli.value(a, "type", "p256"))?)?;
+    let out = cli.value(a, "out", "");
+    if (out == "") {
+        print(keys.to_pem(k));
+    } else {
+        store.write_private(out, keys.to_pem(k))?;
+        eprint("wrote ${out} (${keys.kind_name(k.kind)}, mode 0600)");
+    }
+    Result.Ok(0)
+}
+
+fn cmd_csr(a: Args) -> Result<int, string> {
+    only_flags(a, ["key", "san", "out"])?;
+    let key = keys.from_pem(fs.read_file(cli.value(a, "key", ""))?)?;
+    let names = cli.list(a, "san");
+    let text = pem.encode("CERTIFICATE REQUEST", issue.csr(key, names)?);
+    let out = cli.value(a, "out", "");
+    if (out == "") {
+        print(text);
+    } else {
+        fs.write_file(out, text)?;
+    }
+    Result.Ok(0)
+}
+
+// ---------------------------------------------------------------- the CA
+
+fn cmd_ca(a: Args) -> Result<int, string> {
+    let home = home_of(a);
+    let sub = if (a.positional.len() > 0) { a.positional[0] } else { "" };
+    match (sub) {
+        "init" => {
+            only_flags(a, ["type", "subject", "days", "keychain", "force"])?;
+            let o = ops.CaOptions {
+                kind: keys.parse_kind(cli.value(a, "type", "p256"))?,
+                subject: cli.value(a, "subject", "CN=raycert development CA,O=raycert"),
+                days: cli.int_value(a, "days", 3650)?,
+                keychain_service: cli.value(a, "keychain", ""),
+                force: cli.has(a, "force"),
+            };
+            let c = ops.ca_init(home, o, time.now())?;
+            print("CA created in ${store.ca_dir(home)} (key: ${store.key_ref_text(store.ca_key_ref(home)?)})");
+            for line in report.describe(c, time.now()) {
+                print(line);
+            }
+            Result.Ok(0)
+        },
+        "show" => {
+            only_flags(a, ["qr"])?;
+            let (_, c) = ops.load_ca(home)?;
+            print(store.ca_cert_path(home));
+            for line in report.describe(c, time.now()) {
+                print(line);
+            }
+            if (cli.has(a, "qr")) {
+                print_qr("SHA256:${x509.fingerprint_sha256(c)}")?;
+            }
+            Result.Ok(0)
+        },
+        "remove" => {
+            only_flags(a, [])?;
+            ops.ca_remove(home)?;
+            print("removed ${store.ca_dir(home)}");
+            Result.Ok(0)
+        },
+        _ => Result.Err("usage: raycert ca init|show|remove"),
+    }
+}
+
+// ---------------------------------------------------------------- issue / acme
+
+fn meta_from(a: Args, name: string, source: string) -> Result<store.Meta, string> {
+    store.check_name(name)?;
+    Result.Ok(store.Meta {
+        name: name,
+        source: source,
+        names: cli.list(a, "san"),
+        key_kind: keys.kind_name(keys.parse_kind(cli.value(a, "type", "p256"))?),
+        days: cli.int_value(a, "days", 90)?,
+        directory: cli.value(a, "directory", ""),
+        http_port: cli.int_value(a, "http-port", 80)?,
+        http_host: cli.value(a, "http-host", "::"),
+    })
+}
+
+fn cmd_issue(a: Args) -> Result<int, string> {
+    only_flags(a, ["san", "type", "days", "csr"])?;
+    let home = home_of(a);
+    let name = one_positional(a, "NAME")?;
+    let m = meta_from(a, name, "local")?;
+    let csr_path = cli.value(a, "csr", "");
+    var csr: Option<bytes> = Option.None;
+    if (csr_path != "") {
+        let raw = fs.read_file_bytes(csr_path)?;
+        if (raw.len() > 0 && raw[0] == 0x30) {
+            csr = Option.Some(raw);
+        } else {
+            csr = Option.Some(pem.decode_label(from_utf8(raw)?, "CERTIFICATE REQUEST")?);
+        }
+    }
+    let dir = ops.issue_local(home, m, csr, time.now())?;
+    show_issued(name, dir)
+}
+
+fn show_issued(name: string, dir: string) -> Result<int, string> {
+    let certs = ops.load_certs("${dir}/chain.pem")?;
+    print("${name}: ${dir}/{cert,chain,key}.pem");
+    for line in report.describe(certs[0], time.now()) {
+        print(line);
+    }
+    Result.Ok(0)
+}
+
+fn cmd_acme(a: Args) -> Result<int, string> {
+    only_flags(a, ["directory", "san", "email", "http-port", "http-host", "type", "insecure", "verbose", "days"])?;
+    let home = home_of(a);
+    let name = one_positional(a, "NAME")?;
+    let m = meta_from(a, name, "acme")?;
+    if (m.directory == "") {
+        return Result.Err("--directory URL is required (e.g. https://localhost:14000/dir for Pebble)");
+    }
+    if (m.names.len() == 0) {
+        return Result.Err("--san is required");
+    }
+    let dir = ops.issue_acme(home, m, cli.value(a, "email", ""), cli.has(a, "insecure"), cli.has(a, "verbose"))?;
+    show_issued(name, dir)
+}
+
+// ---------------------------------------------------------------- list / renew
+
+fn cmd_list(a: Args) -> Result<int, string> {
+    only_flags(a, [])?;
+    let home = home_of(a);
+    let now = time.now();
+    for name in store.list_issued(home)? {
+        let m = store.load_meta(home, name)?;
+        match (ops.load_certs("${store.cert_dir(home, name)}/cert.pem")) {
+            Result.Ok(cs) => print("${report.summary(name, cs[0], now)}  [${m.source}]"),
+            Result.Err(e) => print("${name}: ${e}"),
+        }
+    }
+    Result.Ok(0)
+}
+
+fn cmd_renew(a: Args) -> Result<int, string> {
+    only_flags(a, ["within", "force", "hook", "insecure", "verbose"])?;
+    let home = home_of(a);
+    let within = cli.int_value(a, "within", 30)?;
+    let results = ops.renew(home, a.positional, within, cli.has(a, "force"), cli.value(a, "hook", ""), cli.has(a, "insecure"), cli.has(a, "verbose"), time.now())?;
+    var failed = 0;
+    for r in results {
+        let err = if (r.error != "") { ": ${r.error}" } else { "" };
+        print("${r.name}: ${r.action} (${r.days_left} days left before)${err}");
+        if (r.error != "") {
+            failed = failed + 1;
+        }
+    }
+    Result.Ok(if (failed > 0) { 1 } else { 0 })
+}

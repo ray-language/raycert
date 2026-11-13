@@ -1,0 +1,145 @@
+//! The whole ACME issuance: account, order, http-01 responder on a local port, finalize with a
+//! CSR, download, and the chain split into DER certificates.
+
+import acme;
+import issue;
+import jws;
+import keys;
+import net/webserver;
+import std/net;
+import std/pem;
+import std/time;
+from keys import PrivKey;
+
+pub struct Params {
+    directory: string,
+    names: [string],
+    email: string,
+    http_host: string,
+    http_port: int,
+    insecure: bool,
+    verbose: bool,
+    timeout_ms: int,
+}
+
+/// The http-01 responder: GET /.well-known/acme-challenge/<token> → the key authorization.
+/// `tokens` holds token → key authorization; the server stops when `stop` is closed.
+pub fn serve_challenges(listener: int, tokens: Map<string, string>, stop: Channel<int>) -> Result<int, string> {
+    webserver.serve_options_on(listener, webserver.options().with_stop(stop).quiet(), fn() -> fn(webserver.Request) -> webserver.Response {
+        let table = tokens;
+        fn(req: webserver.Request) -> webserver.Response {
+            let prefix = "/.well-known/acme-challenge/";
+            if (req.method != "GET" || !req.path.starts_with(prefix)) {
+                return webserver.not_found();
+            }
+            let token = req.path.substring(prefix.len(), req.path.len());
+            match (table.get(token)) {
+                Option.Some(ka) => {
+                    var r = webserver.text(200, ka);
+                    r.headers.insert("Content-Type", "application/octet-stream");
+                    r
+                },
+                Option.None => webserver.not_found(),
+            }
+        }
+    })
+}
+
+fn wait_status(label: string, timeout_ms: int, poll: fn() -> Result<(string, string), string>) -> Result<string, string> {
+    let deadline = time.monotonic_millis() + timeout_ms;
+    var pause = 250;
+    while (true) {
+        let (status, problem) = poll()?;
+        if (status != "pending" && status != "processing" && status != "ready") {
+            if (status == "invalid") {
+                return Result.Err("${label} is invalid: ${problem}");
+            }
+            return Result.Ok(status);
+        }
+        if (time.monotonic_millis() > deadline) {
+            return Result.Err("${label} still '${status}' after ${timeout_ms} ms");
+        }
+        time.sleep(pause);
+        if (pause < 2000) {
+            pause = pause * 2;
+        }
+    }
+}
+
+/// Runs the issuance and returns the chain as DER, leaf first.
+pub fn obtain(p: Params, account_key: PrivKey, cert_key: PrivKey) -> Result<[bytes], string> {
+    let c = acme.connect(p.directory, account_key, p.insecure, p.verbose)?;
+    let kid = acme.account(c, p.email)?;
+    if (p.verbose) {
+        eprint("acme: account ${kid}");
+    }
+    var order = acme.new_order(c, p.names)?;
+    let tokens: Map<string, string> = Map.new();
+    var pending: [acme.Challenge] = [];
+    var authz_urls: [string] = [];
+    for url in order.authorizations {
+        let a = acme.get_authz(c, url)?;
+        if (a.status == "valid") {
+            continue;
+        }
+        let ch = acme.http01(a).ok_or("no http-01 challenge offered for ${a.identifier}")?;
+        tokens.insert(ch.token, jws.key_authorization(account_key, ch.token)?);
+        pending.push(ch);
+        authz_urls.push(url);
+    }
+    if (pending.len() > 0) {
+        let listener = net.tcp_listen(p.http_host, p.http_port).map_err(fn(e: string) -> string {
+            "http-01 responder on ${p.http_host}:${p.http_port}: ${e}"
+        })?;
+        let stop: Channel<int> = Channel.new();
+        let server = spawn(fn() -> Result<int, string> { serve_challenges(listener, tokens, stop) });
+        let outcome = answer(c, pending, authz_urls, p.timeout_ms);
+        close(stop);
+        join(server)?;
+        outcome?;
+    }
+    let st = wait_status("order", p.timeout_ms, fn() -> Result<(string, string), string> {
+        let o = acme.get_order(c, order.url)?;
+        if (o.status == "ready") {
+            return Result.Ok(("done", ""));
+        }
+        Result.Ok((o.status, o.problem))
+    })?;
+    if (st != "done" && st != "valid") {
+        return Result.Err("order is '${st}'");
+    }
+    let csr = issue.csr(cert_key, p.names)?;
+    order = acme.finalize(c, order, csr)?;
+    wait_status("finalized order", p.timeout_ms, fn() -> Result<(string, string), string> {
+        let o = acme.get_order(c, order.url)?;
+        Result.Ok((o.status, o.problem))
+    })?;
+    order = acme.get_order(c, order.url)?;
+    if (order.certificate == "") {
+        return Result.Err("order is valid but has no certificate URL");
+    }
+    let chain_pem = acme.download(c, order.certificate)?;
+    var out: [bytes] = [];
+    for b in pem.decode_all(chain_pem)? {
+        if (b.label == "CERTIFICATE") {
+            out.push(b.der);
+        }
+    }
+    if (out.len() == 0) {
+        return Result.Err("the certificate URL returned no certificate");
+    }
+    Result.Ok(out)
+}
+
+fn answer(c: acme.Client, pending: [acme.Challenge], urls: [string], timeout_ms: int) -> Result<int, string> {
+    for ch in pending {
+        acme.respond(c, ch)?;
+    }
+    for url in urls {
+        wait_status("authorization", timeout_ms, fn() -> Result<(string, string), string> {
+            let a = acme.get_authz(c, url)?;
+            Result.Ok((a.status, a.problem))
+        })?;
+    }
+    Result.Ok(0)
+}

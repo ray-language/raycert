@@ -1,0 +1,102 @@
+//! What `inspect` prints: one block per certificate, then the chain verdicts.
+
+import der;
+import std/text;
+import oid;
+import verify;
+import x509;
+from x509 import Cert;
+
+pub fn describe(c: Cert, now: int) -> [string] {
+    var out: [string] = [];
+    let row = fn(label: string, value: string) { out.push("  ${text.pad_right(label, 13, " ")}${value}"); };
+    row("Subject:", show_name(c.subject));
+    row("Issuer:", show_name(c.issuer));
+    row("Serial:", x509.colon_hex(c.serial));
+    row("Version:", "${c.version}");
+    let left = x509.days_left(c, now);
+    let state = if (now < c.not_before) {
+        "not yet valid"
+    } else if (left < 0) {
+        "EXPIRED ${-left} days ago"
+    } else {
+        "${left} days left"
+    };
+    row("Validity:", "${x509.date_text(c.not_before)} → ${x509.date_text(c.not_after)} (${state})");
+    row("Key:", x509.key_description(c.spki));
+    row("Signature:", oid.name(c.sig_alg.oid));
+    match (x509.sans(c)) {
+        Result.Ok(names) => {
+            if (names.len() > 0) {
+                row("SANs:", names.join(", "));
+            }
+        },
+        Result.Err(e) => row("SANs:", "<unreadable: ${e}>"),
+    }
+    match (x509.basic_constraints(c)) {
+        Result.Ok(Option.Some((ca, path))) => {
+            let p = if (ca && path >= 0) { " (path length ${path})" } else { "" };
+            row("CA:", "${if (ca) { "yes" } else { "no" }}${p}");
+        },
+        Result.Ok(Option.None) => {},
+        Result.Err(e) => row("CA:", "<unreadable: ${e}>"),
+    }
+    let ku = x509.key_usage(c).unwrap_or([]);
+    if (ku.len() > 0) {
+        row("Key usage:", ku.join(", "));
+    }
+    let eku = x509.ext_key_usage(c).unwrap_or([]);
+    if (eku.len() > 0) {
+        row("Ext. usage:", eku.join(", "));
+    }
+    if let Option.Some(id) = x509.subject_key_id(c) {
+        row("Subject KID:", x509.colon_hex(id));
+    }
+    if let Option.Some(id) = x509.authority_key_id(c) {
+        row("Auth. KID:", x509.colon_hex(id));
+    }
+    var names: [string] = [];
+    for e in c.exts {
+        names.push("${oid.name(e.oid)}${if (e.critical) { " (critical)" } else { "" }}");
+    }
+    if (names.len() > 0) {
+        row("Extensions:", names.join(", "));
+    }
+    row("SHA-256:", x509.fingerprint_sha256(c));
+    row("SHA-1:", x509.fingerprint_sha1(c));
+    out
+}
+
+fn show_name(n: x509.Name) -> string {
+    let s = x509.format_name(n);
+    if (s == "") { "(empty)" } else { s }
+}
+
+pub fn chain_lines(links: [verify.Link]) -> [string] {
+    var out: [string] = [];
+    var i = 0;
+    while (i < links.len()) {
+        let l = links[i];
+        let target = if (i + 1 < links.len()) { "#${i + 2}" } else { l.issuer };
+        let name_note = if (l.name_ok) { "" } else { " — issuer name does not match" };
+        out.push("  #${i + 1} signed by ${target}: ${verify.check_text(l.check)}${name_note}");
+        i = i + 1;
+    }
+    out
+}
+
+/// A one-line summary for `list` and `renew`.
+pub fn summary(name: string, c: Cert, now: int) -> string {
+    let left = x509.days_left(c, now);
+    var sans = x509.sans(c).unwrap_or([]).join(",");
+    if (sans == "") {
+        sans = x509.common_name(c.subject);
+    }
+    let days = text.pad_left("${left}d", 6, " ");
+    "${text.pad_right(name, 20, " ")} ${days}  ${text.pad_right(x509.key_description(c.spki), 10, " ")} ${sans}"
+}
+
+/// `raycert der`: the ASN.1 outline of any DER.
+pub fn outline(b: bytes) -> Result<string, string> {
+    der.dump(b)
+}

@@ -1,0 +1,218 @@
+//! The on-disk store: `<home>/ca/` (the development CA), `<home>/certs/<name>/` (key, leaf,
+//! chain, meta.json) and `<home>/acme/` (accounts). Private keys are written 0600 inside 0700
+//! directories, or kept in the system keychain.
+
+import keys;
+import std/fs;
+import std/json;
+import std/keychain;
+import std/pem;
+from keys import PrivKey;
+
+pub const PRIVATE_FILE: int = 0o600;
+pub const PRIVATE_DIR: int = 0o700;
+
+pub fn default_home() -> string {
+    match (env("RAYCERT_HOME")) {
+        Option.Some(h) => h,
+        Option.None => "${env("HOME").unwrap_or(".")}/.raycert",
+    }
+}
+
+/// A directory only its owner can enter (created if missing; mode tightened if it existed).
+pub fn private_dir(path: string) -> Result<int, string> {
+    fs.mkdir(path)?;
+    fs.chmod(path, PRIVATE_DIR)
+}
+
+/// Writes a secret file 0600. std/fs has no "create with mode" (nor umask), so the file is first
+/// created EMPTY, narrowed to 0600, and only then filled: the window where another user could
+/// open it holds no secret. (The parent directory is 0700 too.)
+pub fn write_private(path: string, content: string) -> Result<int, string> {
+    fs.write_file(path, "")?;
+    fs.chmod(path, PRIVATE_FILE)?;
+    fs.write_file(path, content)
+}
+
+/// Writes through a temporary sibling and rename, so a reader (raygate reloading) never sees half
+/// a file. `private` keeps the 0600 mode.
+pub fn write_atomic(path: string, content: string, private: bool) -> Result<int, string> {
+    let tmp = "${path}.tmp";
+    if (private) {
+        write_private(tmp, content)?;
+    } else {
+        fs.write_file(tmp, content)?;
+    }
+    fs.rename(tmp, path)
+}
+
+pub fn mode_of(path: string) -> Result<int, string> {
+    Result.Ok(fs.stat(path)?.mode)
+}
+
+// ---------------------------------------------------------------- keys
+
+/// Where a private key lives: a PEM file, or a keychain item.
+pub enum KeyRef {
+    File(string),
+    Keychain(string, string),
+}
+
+pub fn key_ref_text(r: KeyRef) -> string {
+    match (r) {
+        KeyRef.File(p) => p,
+        KeyRef.Keychain(service, account) => "keychain:${service}/${account}",
+    }
+}
+
+pub fn save_key(r: KeyRef, k: PrivKey) -> Result<int, string> {
+    match (r) {
+        KeyRef.File(p) => write_atomic(p, keys.to_pem(k), true),
+        KeyRef.Keychain(service, account) => keychain.set(service, account, keys.to_pem(k)),
+    }
+}
+
+pub fn load_key(r: KeyRef) -> Result<PrivKey, string> {
+    match (r) {
+        KeyRef.File(p) => keys.from_pem(fs.read_file(p)?),
+        KeyRef.Keychain(service, account) => {
+            match (keychain.get(service, account)?) {
+                Option.Some(text) => keys.from_pem(text),
+                Option.None => Result.Err("no key in the keychain under ${service}/${account}"),
+            }
+        },
+    }
+}
+
+pub fn delete_key(r: KeyRef) -> Result<bool, string> {
+    match (r) {
+        KeyRef.File(p) => {
+            if (fs.exists(p)) {
+                fs.remove_file(p)?;
+                return Result.Ok(true);
+            }
+            Result.Ok(false)
+        },
+        KeyRef.Keychain(service, account) => keychain.delete(service, account),
+    }
+}
+
+// ---------------------------------------------------------------- the CA
+
+pub fn ca_dir(home: string) -> string {
+    "${home}/ca"
+}
+
+pub fn ca_cert_path(home: string) -> string {
+    "${ca_dir(home)}/ca.pem"
+}
+
+/// `ca/key.pem`, or the keychain item named in `ca/key.keychain` (`service\naccount`).
+pub fn ca_key_ref(home: string) -> Result<KeyRef, string> {
+    let pointer = "${ca_dir(home)}/key.keychain";
+    if (fs.exists(pointer)) {
+        let lines = fs.read_file(pointer)?.trim().split("\n");
+        if (lines.len() != 2) {
+            return Result.Err("${pointer}: expected 'service' and 'account' lines");
+        }
+        return Result.Ok(KeyRef.Keychain(lines[0], lines[1]));
+    }
+    Result.Ok(KeyRef.File("${ca_dir(home)}/key.pem"))
+}
+
+// ---------------------------------------------------------------- issued certificates
+
+/// What `renew` needs to obtain a certificate again.
+pub struct Meta {
+    name: string,
+    source: string,
+    names: [string],
+    key_kind: string,
+    days: int,
+    directory: string,
+    http_port: int,
+    http_host: string,
+}
+
+pub fn cert_dir(home: string, name: string) -> string {
+    "${home}/certs/${name}"
+}
+
+pub fn check_name(name: string) -> Result<int, string> {
+    if (name.len() == 0 || name.len() > 64 || name.starts_with(".")) {
+        return Result.Err("bad certificate name '${name}'");
+    }
+    for c in name.chars() {
+        let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+        if (!ok) {
+            return Result.Err("bad certificate name '${name}' (letters, digits, - _ . only)");
+        }
+    }
+    Result.Ok(0)
+}
+
+pub fn meta_json(m: Meta) -> string {
+    json.obj()
+        .field("name", m.name)
+        .field("source", m.source)
+        .field("names", json.list(m.names))
+        .field("key", m.key_kind)
+        .field("days", m.days)
+        .field("directory", m.directory)
+        .field("http_port", m.http_port)
+        .field("http_host", m.http_host)
+        .render_pretty(2)
+}
+
+pub fn parse_meta(text: string) -> Result<Meta, string> {
+    let j = json.parse(text)?;
+    var names: [string] = [];
+    for n in json.get_array(j, "names").unwrap_or([]) {
+        names.push(json.as_string(n).unwrap_or(""));
+    }
+    Result.Ok(Meta {
+        name: json.get_string(j, "name").ok_or("meta.json without name")?,
+        source: json.get_string(j, "source").unwrap_or("local"),
+        names: names,
+        key_kind: json.get_string(j, "key").unwrap_or("p256"),
+        days: json.get_int(j, "days").unwrap_or(90),
+        directory: json.get_string(j, "directory").unwrap_or(""),
+        http_port: json.get_int(j, "http_port").unwrap_or(80),
+        http_host: json.get_string(j, "http_host").unwrap_or("0.0.0.0"),
+    })
+}
+
+/// Writes key.pem (0600), cert.pem (the leaf), chain.pem (leaf + issuers) and meta.json.
+pub fn save_issued(home: string, m: Meta, key: PrivKey, chain_der: [bytes]) -> Result<string, string> {
+    check_name(m.name)?;
+    fs.mkdir("${home}/certs")?;
+    let dir = cert_dir(home, m.name);
+    private_dir(dir)?;
+    save_key(KeyRef.File("${dir}/key.pem"), key)?;
+    var chain: [string] = [];
+    for d in chain_der {
+        chain.push(pem.encode("CERTIFICATE", d));
+    }
+    write_atomic("${dir}/cert.pem", chain[0], false)?;
+    write_atomic("${dir}/chain.pem", chain.join(""), false)?;
+    write_atomic("${dir}/meta.json", meta_json(m) + "\n", false)?;
+    Result.Ok(dir)
+}
+
+pub fn list_issued(home: string) -> Result<[string], string> {
+    let root = "${home}/certs";
+    if (!fs.is_dir(root)) {
+        return Result.Ok([]);
+    }
+    var out: [string] = [];
+    for n in sort(fs.list_dir(root)?) {
+        if (fs.exists("${root}/${n}/meta.json")) {
+            out.push(n);
+        }
+    }
+    Result.Ok(out)
+}
+
+pub fn load_meta(home: string, name: string) -> Result<Meta, string> {
+    parse_meta(fs.read_file("${cert_dir(home, name)}/meta.json")?)
+}

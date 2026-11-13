@@ -1,0 +1,287 @@
+//! The operations behind the commands, with no printing: the CLI and the tests both call them.
+
+import issue;
+import keys;
+import obtain;
+import store;
+import tlsprobe;
+import x509;
+import std/fs;
+import std/pem;
+import std/process;
+from keys import KeyKind, PrivKey;
+from store import KeyRef, Meta;
+from x509 import Cert;
+
+// ---------------------------------------------------------------- loading certificates
+
+/// Every certificate in a PEM file (also `TRUSTED CERTIFICATE`-free bundles) or one DER file.
+pub fn load_certs(path: string) -> Result<[Cert], string> {
+    let raw = fs.read_file_bytes(path)?;
+    certs_of(raw)
+}
+
+pub fn certs_of(raw: bytes) -> Result<[Cert], string> {
+    if (raw.len() > 0 && raw[0] == 0x30) {
+        return Result.Ok([x509.parse(raw)?]);
+    }
+    let text = from_utf8(raw)?;
+    var out: [Cert] = [];
+    var i = 0;
+    for b in pem.decode_all(text)? {
+        i = i + 1;
+        if (b.label == "CERTIFICATE") {
+            out.push(x509.parse(b.der).map_err(fn(e: string) -> string { "PEM block ${i}: ${e}" })?);
+        }
+    }
+    if (out.len() == 0) {
+        return Result.Err("no CERTIFICATE block found");
+    }
+    Result.Ok(out)
+}
+
+/// `host:port` (or `[v6]:port`) when the argument is not an existing file.
+pub fn split_host_port(s: string) -> Option<(string, int)> {
+    if (fs.exists(s)) {
+        return Option.None;
+    }
+    let colon = s.last_index_of(":")?;
+    let host = s.substring(0, colon).strip_prefix("[").unwrap_or(s.substring(0, colon));
+    let port = parse_int(s.substring(colon + 1, s.len()))?;
+    let h = host.strip_suffix("]").unwrap_or(host);
+    if (h.len() == 0 || port <= 0 || port > 65535) {
+        return Option.None;
+    }
+    Option.Some((h, port))
+}
+
+pub fn remote_chain(host: string, port: int) -> Result<[Cert], string> {
+    var out: [Cert] = [];
+    for d in tlsprobe.fetch_chain(host, port, 8000)? {
+        out.push(x509.parse(d)?);
+    }
+    Result.Ok(out)
+}
+
+/// The system trust store, when there is one at a known place (used as chain anchors).
+pub fn system_anchors() -> [Cert] {
+    for p in [env("SSL_CERT_FILE").unwrap_or(""), "/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"] {
+        if (p != "" && fs.exists(p)) {
+            match (load_certs(p)) {
+                Result.Ok(cs) => return cs,
+                Result.Err(_) => {},
+            }
+        }
+    }
+    []
+}
+
+// ---------------------------------------------------------------- the CA
+
+pub struct CaOptions {
+    kind: KeyKind,
+    subject: string,
+    days: int,
+    keychain_service: string,
+    force: bool,
+}
+
+/// Creates the development CA: key (file 0600 or keychain) + self-signed certificate.
+pub fn ca_init(home: string, o: CaOptions, now: int) -> Result<Cert, string> {
+    let dir = store.ca_dir(home);
+    if (fs.exists(store.ca_cert_path(home)) && !o.force) {
+        return Result.Err("a CA already exists in ${dir} (use --force to replace it)");
+    }
+    fs.mkdir(home)?;
+    store.private_dir(dir)?;
+    let key = keys.generate(o.kind)?;
+    let ref = if (o.keychain_service != "") {
+        KeyRef.Keychain(o.keychain_service, fs.real_path(dir)?)
+    } else {
+        KeyRef.File("${dir}/key.pem")
+    };
+    store.save_key(ref, key)?;
+    let pointer = "${dir}/key.keychain";
+    match (ref) {
+        KeyRef.Keychain(service, account) => {
+            fs.write_file(pointer, "${service}\n${account}\n")?;
+            if (fs.exists("${dir}/key.pem")) {
+                fs.remove_file("${dir}/key.pem")?;
+            }
+        },
+        KeyRef.File(_) => {
+            if (fs.exists(pointer)) {
+                fs.remove_file(pointer)?;
+            }
+        },
+    }
+    let subject = x509.parse_dn(o.subject)?;
+    let der = issue.self_signed_ca(key, subject, now, o.days)?;
+    store.write_atomic(store.ca_cert_path(home), pem.encode("CERTIFICATE", der), false)?;
+    x509.parse(der)
+}
+
+pub fn load_ca(home: string) -> Result<(PrivKey, Cert), string> {
+    let path = store.ca_cert_path(home);
+    if (!fs.exists(path)) {
+        return Result.Err("no CA in ${store.ca_dir(home)}: run `raycert ca init` first");
+    }
+    let certs = load_certs(path)?;
+    let key = store.load_key(store.ca_key_ref(home)?)?;
+    Result.Ok((key, certs[0]))
+}
+
+/// Removes the CA, including its keychain item if it has one.
+pub fn ca_remove(home: string) -> Result<int, string> {
+    let r = store.ca_key_ref(home)?;
+    store.delete_key(r)?;
+    fs.remove_all(store.ca_dir(home))
+}
+
+// ---------------------------------------------------------------- issuing
+
+/// Issues (or re-issues) `m.name` from the local CA, or from a CSR's key when `csr` is given.
+pub fn issue_local(home: string, m: Meta, csr_der: Option<bytes>, now: int) -> Result<string, string> {
+    let (ca_key, ca) = load_ca(home)?;
+    var names = m.names;
+    match (csr_der) {
+        Option.Some(d) => {
+            let c = issue.parse_csr(d)?;
+            if (!c.signature_ok) {
+                return Result.Err("the CSR's self-signature does not verify");
+            }
+            if (names.len() == 0) {
+                for n in c.names {
+                    names.push(n.strip_prefix("DNS:").unwrap_or(n.strip_prefix("IP:").unwrap_or(n)));
+                }
+            }
+            if (names.len() == 0) {
+                return Result.Err("no names: pass --san or a CSR with a subjectAltName");
+            }
+            let req = issue.LeafRequest { subject: x509.cn_name(names[0]), spki: c.spki.raw, names: names, days: m.days };
+            let leaf = issue.leaf(req, ca_key, ca, now)?;
+            let dir = store.cert_dir(home, m.name);
+            fs.mkdir("${home}/certs")?;
+            store.private_dir(dir)?;
+            let chain = pem.encode("CERTIFICATE", leaf) + pem.encode("CERTIFICATE", ca.raw);
+            store.write_atomic("${dir}/cert.pem", pem.encode("CERTIFICATE", leaf), false)?;
+            store.write_atomic("${dir}/chain.pem", chain, false)?;
+            var m2 = m;
+            m2.names = names;
+            m2.source = "csr";
+            store.write_atomic("${dir}/meta.json", store.meta_json(m2) + "\n", false)?;
+            return Result.Ok(dir);
+        },
+        Option.None => {},
+    }
+    if (names.len() == 0) {
+        return Result.Err("no names: pass --san");
+    }
+    let key = keys.generate(keys.parse_kind(m.key_kind)?)?;
+    let req = issue.LeafRequest { subject: x509.cn_name(names[0]), spki: keys.spki_der(key)?, names: names, days: m.days };
+    let leaf = issue.leaf(req, ca_key, ca, now)?;
+    store.save_issued(home, m, key, [leaf, ca.raw])
+}
+
+pub fn acme_account_key(home: string) -> Result<PrivKey, string> {
+    let dir = "${home}/acme";
+    let path = "${dir}/account.key.pem";
+    if (fs.exists(path)) {
+        return keys.from_pem(fs.read_file(path)?);
+    }
+    fs.mkdir(home)?;
+    store.private_dir(dir)?;
+    let k = keys.generate(KeyKind.P256)?;
+    store.save_key(KeyRef.File(path), k)?;
+    Result.Ok(k)
+}
+
+pub fn issue_acme(home: string, m: Meta, email: string, insecure: bool, verbose: bool) -> Result<string, string> {
+    let account = acme_account_key(home)?;
+    let key = keys.generate(keys.parse_kind(m.key_kind)?)?;
+    let p = obtain.Params {
+        directory: m.directory,
+        names: m.names,
+        email: email,
+        http_host: m.http_host,
+        http_port: m.http_port,
+        insecure: insecure,
+        verbose: verbose,
+        timeout_ms: 60000,
+    };
+    let chain = obtain.obtain(p, account, key)?;
+    store.save_issued(home, m, key, chain)
+}
+
+// ---------------------------------------------------------------- renewal
+
+pub struct RenewResult {
+    name: string,
+    days_left: int,
+    action: string,
+    error: string,
+}
+
+/// Re-issues every stored certificate with fewer than `within` days left (or all with `force`),
+/// then runs `hook` once per renewed certificate.
+pub fn renew(home: string, only: [string], within: int, force: bool, hook: string, insecure: bool, verbose: bool, now: int) -> Result<[RenewResult], string> {
+    var out: [RenewResult] = [];
+    for name in store.list_issued(home)? {
+        if (only.len() > 0 && !only.contains(name)) {
+            continue;
+        }
+        let m = store.load_meta(home, name)?;
+        let dir = store.cert_dir(home, name);
+        let left = match (load_certs("${dir}/cert.pem")) {
+            Result.Ok(cs) => x509.days_left(cs[0], now),
+            Result.Err(_) => -1,
+        };
+        if (!force && left >= within) {
+            out.push(RenewResult { name: name, days_left: left, action: "kept", error: "" });
+            continue;
+        }
+        let r = if (m.source == "acme") {
+            issue_acme(home, m, "", insecure, verbose)
+        } else if (m.source == "csr") {
+            Result.Err("issued from a CSR: the key is not ours; issue it again with --csr")
+        } else {
+            issue_local(home, m, Option.None, now)
+        };
+        match (r) {
+            Result.Ok(_) => {
+                var action = "renewed";
+                if (hook != "") {
+                    match (run_hook(hook, name, dir)) {
+                        Result.Ok(_) => action = "renewed + hook",
+                        Result.Err(e) => {
+                            out.push(RenewResult { name: name, days_left: left, action: "renewed", error: "hook: ${e}" });
+                            continue;
+                        },
+                    }
+                }
+                out.push(RenewResult { name: name, days_left: left, action: action, error: "" });
+            },
+            Result.Err(e) => out.push(RenewResult { name: name, days_left: left, action: "failed", error: e }),
+        }
+    }
+    Result.Ok(out)
+}
+
+/// `sh -c HOOK` with the paths in the environment — e.g. copy them where raygate/raylb read
+/// them and ask it to reload.
+pub fn run_hook(hook: string, name: string, dir: string) -> Result<int, string> {
+    let out = process.cmd("sh", ["-c", hook])
+        .env("RAYCERT_NAME", name)
+        .env("RAYCERT_DIR", dir)
+        .env("RAYCERT_CERT", "${dir}/cert.pem")
+        .env("RAYCERT_CHAIN", "${dir}/chain.pem")
+        .env("RAYCERT_KEY", "${dir}/key.pem")
+        .timeout_ms(60000)
+        .merge_output()
+        .run()?;
+    match (out.exit) {
+        process.Exit.Code(0) => Result.Ok(0),
+        process.Exit.Code(n) => Result.Err("exit ${n}: ${from_utf8(out.stdout).unwrap_or("").trim()}"),
+        process.Exit.Signal(s) => Result.Err("killed by signal ${s}"),
+    }
+}

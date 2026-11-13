@@ -1,0 +1,64 @@
+//! JSON Web Signature for ACME (RFC 7515 flattened serialization, RFC 7638 thumbprints): the
+//! JWK of a key, its thumbprint, and signed requests.
+
+import keys;
+import std/crypto;
+import std/json;
+from keys import KeyKind, PrivKey;
+from std/base64 import base64url;
+
+pub fn alg(k: PrivKey) -> string {
+    match (k.kind) {
+        KeyKind.Ed25519 => "EdDSA",
+        KeyKind.P256 => "ES256",
+        KeyKind.Rsa(_) => "RS256",
+    }
+}
+
+/// The public JWK with ONLY the required members, in lexicographic order: rendered compact, it
+/// is exactly the text RFC 7638 hashes for the thumbprint.
+pub fn jwk(k: PrivKey) -> Result<json.Obj, string> {
+    let raw = keys.public_raw(k)?;
+    match (k.kind) {
+        KeyKind.Ed25519 => Result.Ok(json.obj().field("crv", "Ed25519").field("kty", "OKP").field("x", base64url(raw))),
+        KeyKind.P256 => {
+            if (raw.len() != 65 || raw[0] != 4) {
+                return Result.Err("unexpected P-256 public key encoding");
+            }
+            let x = base64url(raw.sub_bytes(1, 33));
+            let y = base64url(raw.sub_bytes(33, 65));
+            Result.Ok(json.obj().field("crv", "P-256").field("kty", "EC").field("x", x).field("y", y))
+        },
+        KeyKind.Rsa(_) => {
+            let (n, e) = crypto.rsa_public_components(raw)?;
+            Result.Ok(json.obj().field("e", base64url(e)).field("kty", "RSA").field("n", base64url(n)))
+        },
+    }
+}
+
+pub fn thumbprint(k: PrivKey) -> Result<string, string> {
+    Result.Ok(base64url(crypto.sha256(jwk(k)?.render().to_bytes())))
+}
+
+/// The protected header: `jwk` for a new account, `kid` (the account URL) afterwards.
+pub fn protected(k: PrivKey, kid: string, nonce: string, url: string) -> Result<string, string> {
+    let o = json.obj().field("alg", alg(k)).field("nonce", nonce).field("url", url);
+    if (kid == "") {
+        return Result.Ok(o.field("jwk", jwk(k)?).render());
+    }
+    Result.Ok(o.field("kid", kid).render())
+}
+
+/// A flattened JWS: `{"protected": …, "payload": …, "signature": …}`. `payload` "" is the
+/// POST-as-GET of RFC 8555 §6.3 (empty payload, not "{}").
+pub fn sign(k: PrivKey, protected_json: string, payload: string) -> Result<string, string> {
+    let p64 = base64url(protected_json.to_bytes());
+    let b64 = if (payload == "") { "" } else { base64url(payload.to_bytes()) };
+    let sig = keys.sign_jws(k, "${p64}.${b64}".to_bytes())?;
+    Result.Ok(json.obj().field("protected", p64).field("payload", b64).field("signature", base64url(sig)).render())
+}
+
+/// The key authorization of an http-01 challenge: `token.thumbprint`.
+pub fn key_authorization(k: PrivKey, token: string) -> Result<string, string> {
+    Result.Ok("${token}.${thumbprint(k)?}")
+}

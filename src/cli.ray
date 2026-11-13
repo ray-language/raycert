@@ -1,0 +1,109 @@
+//! Command-line arguments: positionals, `--flag value` (repeatable, `--san a,b` splits) and
+//! boolean switches.
+
+pub struct Args {
+    positional: [string],
+    values: Map<string, [string]>,
+    switches: [string],
+}
+
+/// `bool_flags` are the switches that take no value.
+pub fn parse(argv: [string], bool_flags: [string]) -> Result<Args, string> {
+    let values: Map<string, [string]> = Map.new();
+    var positional: [string] = [];
+    var switches: [string] = [];
+    var i = 0;
+    while (i < argv.len()) {
+        let a = argv[i];
+        if (a.starts_with("--") && a.len() > 2) {
+            var key = a.substring(2, a.len());
+            var value = "";
+            var has_value = false;
+            if let Option.Some(eq) = key.index_of("=") {
+                value = key.substring(eq + 1, key.len());
+                key = key.substring(0, eq);
+                has_value = true;
+            }
+            if (bool_flags.contains(key)) {
+                if (has_value) {
+                    return Result.Err("--${key} takes no value");
+                }
+                switches.push(key);
+            } else {
+                if (!has_value) {
+                    if (i + 1 >= argv.len()) {
+                        return Result.Err("--${key} needs a value");
+                    }
+                    i = i + 1;
+                    value = argv[i];
+                }
+                var list = values.get_or(key, []);
+                list.push(value);
+                values.insert(key, list);
+            }
+        } else if (a == "-o" || a == "-v") {
+            if (a == "-v") {
+                switches.push("verbose");
+            } else {
+                if (i + 1 >= argv.len()) {
+                    return Result.Err("-o needs a value");
+                }
+                i = i + 1;
+                var list = values.get_or("out", []);
+                list.push(argv[i]);
+                values.insert("out", list);
+            }
+        } else {
+            positional.push(a);
+        }
+        i = i + 1;
+    }
+    Result.Ok(Args { positional: positional, values: values, switches: switches })
+}
+
+pub fn has(a: Args, name: string) -> bool {
+    a.switches.contains(name)
+}
+
+pub fn value(a: Args, name: string, default: string) -> string {
+    match (a.values.get(name)) {
+        Option.Some(list) => list[list.len() - 1],
+        Option.None => default,
+    }
+}
+
+pub fn int_value(a: Args, name: string, default: int) -> Result<int, string> {
+    match (a.values.get(name)) {
+        Option.Some(list) => parse_int(list[list.len() - 1]).ok_or("--${name} must be a number"),
+        Option.None => Result.Ok(default),
+    }
+}
+
+/// Every value of a repeatable flag, comma-separated values split: `--san a,b --san c`.
+pub fn list(a: Args, name: string) -> [string] {
+    var out: [string] = [];
+    for v in a.values.get_or(name, []) {
+        for part in v.split(",") {
+            let p = part.trim();
+            if (p.len() > 0) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Flags that the command does not know: a typo should not be silently ignored.
+pub fn unknown(a: Args, known: [string]) -> Option<string> {
+    for k in a.values.keys() {
+        if (!known.contains(k)) {
+            return Option.Some(k);
+        }
+    }
+    for s in a.switches {
+        if (!known.contains(s)) {
+            return Option.Some(s);
+        }
+    }
+    Option.None
+}
