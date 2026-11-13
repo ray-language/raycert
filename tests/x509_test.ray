@@ -1,0 +1,97 @@
+import ops;
+import oid;
+import verify;
+import x509;
+import std/fs;
+
+// Public certificates only: ISRG Root X1, and a Pebble test chain (leaf + Pebble's throwaway
+// intermediate) obtained by raycert itself.
+
+@test
+fn isrg_root_x1_matches_openssl() {
+    let certs = ops.load_certs("tests/fixtures/isrg-root-x1.pem").unwrap();
+    assert_eq(certs.len(), 1);
+    let c = certs[0];
+    assert_eq(x509.format_name(c.subject), "C=US, O=Internet Security Research Group, CN=ISRG Root X1");
+    assert_eq(c.version, 3);
+    assert_eq(x509.colon_hex(c.serial), "82:10:CF:B0:D2:40:E3:59:44:63:E0:BB:63:82:8B:00");
+    assert_eq(x509.fingerprint_sha256(c), "96:BC:EC:06:26:49:76:F3:74:60:77:9A:CF:28:C5:A7:CF:E8:A3:C0:AA:E1:1A:8F:FC:EE:05:C0:BD:DF:08:C6");
+    assert_eq(x509.key_description(c.spki), "RSA 4096");
+    assert_eq(x509.date_text(c.not_before), "2015-06-04T11:04:38Z");
+    assert_eq(x509.date_text(c.not_after), "2035-06-04T11:04:38Z");
+    assert(x509.self_issued(c));
+    assert_eq(x509.basic_constraints(c).unwrap(), Option.Some((true, -1)));
+    assert_eq(x509.key_usage(c).unwrap(), ["keyCertSign", "cRLSign"]);
+    assert(verify.is_valid(verify.cert_signed_by(c, c)));
+}
+
+@test
+fn pebble_leaf_has_an_empty_subject_and_a_critical_san() {
+    let certs = ops.load_certs("tests/fixtures/pebble-chain.pem").unwrap();
+    assert_eq(certs.len(), 2);
+    let leaf = certs[0];
+    assert_eq(x509.format_name(leaf.subject), "");
+    assert_eq(x509.sans(leaf).unwrap(), ["DNS:localhost"]);
+    let san = x509.find_ext(leaf, oid.SUBJECT_ALT_NAME).unwrap();
+    assert(san.critical);
+    assert_eq(x509.colon_hex(leaf.serial), "56:90:88:42:16:0F:4E:14");
+    assert_eq(x509.fingerprint_sha256(leaf), "20:1D:3A:BF:DA:FB:ED:E4:21:84:9D:A3:30:F7:8A:E7:86:B1:77:78:25:65:3F:5C:E8:8A:64:4D:6E:A6:D1:48");
+    let links = verify.chain(certs, []);
+    assert(verify.is_valid(links[0].check));
+    assert(links[0].name_ok);
+}
+
+@test
+fn a_tampered_certificate_does_not_verify() {
+    let certs = ops.load_certs("tests/fixtures/isrg-root-x1.pem").unwrap();
+    let raw = certs[0].raw;
+    var octets: [int] = [];
+    for o in raw {
+        octets.push(o);
+    }
+    // Flip a bit inside the subject's CN (the TBS), keeping the DER valid.
+    let at = raw.index_of("ISRG Root X1".to_bytes()).unwrap();
+    octets[at] = octets[at] ^ 1;
+    let bad = x509.parse(bytes_of(octets)).unwrap();
+    match (verify.cert_signed_by(bad, certs[0])) {
+        verify.Check.Invalid(_) => {},
+        other => panic("expected Invalid, got ${verify.check_text(other)}"),
+    }
+}
+
+@test
+fn der_and_pem_inputs_read_alike() {
+    let pem_certs = ops.load_certs("tests/fixtures/isrg-root-x1.pem").unwrap();
+    let from_der = ops.certs_of(pem_certs[0].raw).unwrap();
+    assert_eq(x509.fingerprint_sha256(from_der[0]), x509.fingerprint_sha256(pem_certs[0]));
+    assert(ops.certs_of("not a certificate".to_bytes()).is_err());
+}
+
+@test
+fn every_root_of_the_system_store_parses() {
+    let path = "/etc/ssl/cert.pem";
+    if (!fs.exists(path)) {
+        return;
+    }
+    let text = fs.read_file(path).unwrap();
+    let expected = text.split("BEGIN CERTIFICATE").len() - 1;
+    let certs = ops.load_certs(path).unwrap();
+    assert_eq(certs.len(), expected);
+    var rsa_ok = 0;
+    for c in certs {
+        assert(x509.days_left(c, 0) > 0);
+        if (c.sig_alg.oid == oid.SHA256_WITH_RSA && x509.self_issued(c)) {
+            assert(verify.is_valid(verify.cert_signed_by(c, c)));
+            rsa_ok = rsa_ok + 1;
+        }
+    }
+    assert(rsa_ok > 10);
+}
+
+@test
+fn host_port_is_told_apart_from_a_file() {
+    assert_eq(ops.split_host_port("example.com:443"), Option.Some(("example.com", 443)));
+    assert_eq(ops.split_host_port("[::1]:8443"), Option.Some(("::1", 8443)));
+    assert_eq(ops.split_host_port("tests/fixtures/isrg-root-x1.pem"), Option.None);
+    assert_eq(ops.split_host_port("host:99999"), Option.None);
+}

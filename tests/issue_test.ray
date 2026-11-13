@@ -1,0 +1,136 @@
+import der;
+import issue;
+import keys;
+import oid;
+import verify;
+import x509;
+import std/hex;
+import std/pem;
+import std/time;
+from keys import KeyKind;
+
+const NOW: int = 1_790_000_000_000;
+
+fn ca_for(kind: KeyKind) -> (keys.PrivKey, x509.Cert) {
+    let k = keys.generate(kind).unwrap();
+    let der_ca = issue.self_signed_ca(k, x509.parse_dn("CN=Test CA,O=raycert,C=ES").unwrap(), NOW, 30).unwrap();
+    (k, x509.parse(der_ca).unwrap())
+}
+
+@test
+fn each_key_type_signs_a_verifiable_chain() {
+    for kind in [KeyKind.Ed25519, KeyKind.P256, KeyKind.Rsa(2048)] {
+        let (k, ca) = ca_for(kind);
+        assert(verify.is_valid(verify.cert_signed_by(ca, ca)));
+        assert_eq(ca.sig_alg.oid, keys.sig_alg(k).oid);
+        let lk = keys.generate(KeyKind.P256).unwrap();
+        let req = issue.LeafRequest { subject: x509.cn_name("svc.test"), spki: keys.spki_der(lk).unwrap(), names: ["svc.test", "10.0.0.1"], days: 7 };
+        let leaf = x509.parse(issue.leaf(req, k, ca, NOW).unwrap()).unwrap();
+        let links = verify.chain([leaf, ca], []);
+        assert_eq(links.len(), 2);
+        assert(verify.is_valid(links[0].check));
+        assert(verify.is_valid(links[1].check));
+        assert_eq(x509.sans(leaf).unwrap(), ["DNS:svc.test", "IP:10.0.0.1"]);
+        assert_eq(x509.days_left(leaf, NOW), 7);
+        assert_eq(x509.authority_key_id(leaf), x509.subject_key_id(ca));
+    }
+}
+
+@test
+fn subject_names_encode_as_rfc_5280_recommends() {
+    let n = x509.parse_dn("CN=café,O=raycert,C=ES").unwrap();
+    let parsed = x509.parse_name(der.parse(n.to_der()).unwrap()).unwrap();
+    assert_eq(x509.format_name(parsed), "CN=café, O=raycert, C=ES");
+    assert_eq(parsed.rdns[0][0].tag, der.TAG_UTF8);
+    assert_eq(parsed.rdns[2][0].tag, der.TAG_PRINTABLE);
+    assert(x509.parse_dn("XX=1").is_err());
+    assert(x509.parse_dn("").is_err());
+}
+
+@test
+fn key_usage_bits_match_openssl() {
+    // openssl: keyUsage=critical,digitalSignature,keyCertSign,cRLSign -> 03 02 01 86
+    assert_eq(hex.hex_encode(issue.key_usage([0, 5, 6]).value), "03020186");
+    // digitalSignature, keyEncipherment -> 03 02 05 a0
+    assert_eq(hex.hex_encode(issue.key_usage([0, 2]).value), "030205a0");
+    // decipherOnly (bit 8) needs a second octet
+    assert_eq(hex.hex_encode(issue.key_usage([0, 8]).value), "0303078080");
+}
+
+@test
+fn ip_addresses_and_dns_names_are_told_apart() {
+    assert_eq(hex.hex_encode(issue.parse_ip("127.0.0.1").unwrap()), "7f000001");
+    assert_eq(hex.hex_encode(issue.parse_ip("::1").unwrap()), "00000000000000000000000000000001");
+    assert_eq(hex.hex_encode(issue.parse_ip("2001:db8::8:800:200c:417a").unwrap()), "20010db8000000000008080020 0c417a".replace(" ", ""));
+    assert_eq(issue.parse_ip("256.0.0.1"), Option.None);
+    assert_eq(issue.parse_ip("1.2.3"), Option.None);
+    assert_eq(issue.parse_ip("1::2::3"), Option.None);
+    assert(issue.check_dns_name("*.example.com").is_ok());
+    assert(issue.check_dns_name("a..b").is_err());
+    assert(issue.check_dns_name("-a.b").is_err());
+    assert(issue.check_dns_name("a b").is_err());
+    assert(issue.subject_alt_name(["ok.test", "bad name"]).is_err());
+    let e = issue.subject_alt_name(["Example.TEST", "::1"]).unwrap();
+    assert_eq(x509.general_names(e.value).unwrap(), ["DNS:example.test", "IP:0:0:0:0:0:0:0:1"]);
+}
+
+@test
+fn serials_are_positive_and_random() {
+    let a = issue.random_serial();
+    let b = issue.random_serial();
+    assert_eq(a.len(), 16);
+    assert(a[0] < 0x80 && a[0] > 0);
+    assert(a != b);
+}
+
+@test
+fn a_leaf_never_outlives_its_ca() {
+    let (k, ca) = ca_for(KeyKind.P256);
+    let req = issue.LeafRequest { subject: x509.cn_name("long.test"), spki: keys.spki_der(k).unwrap(), names: ["long.test"], days: 400 };
+    let leaf = x509.parse(issue.leaf(req, k, ca, NOW).unwrap()).unwrap();
+    assert_eq(leaf.not_after, ca.not_after);
+}
+
+@test
+fn csr_round_trips_and_detects_tampering() {
+    for kind in [KeyKind.Ed25519, KeyKind.P256, KeyKind.Rsa(2048)] {
+        let k = keys.generate(kind).unwrap();
+        let d = issue.csr(k, ["a.test", "b.test", "192.168.1.1"]).unwrap();
+        let c = issue.parse_csr(d).unwrap();
+        assert(c.signature_ok);
+        assert_eq(x509.common_name(c.subject), "a.test");
+        assert_eq(c.names, ["DNS:a.test", "DNS:b.test", "IP:192.168.1.1"]);
+        assert_eq(c.spki.raw, keys.spki_der(k).unwrap());
+        var octets: [int] = [];
+        for o in d {
+            octets.push(o);
+        }
+        let at = d.index_of("b.test".to_bytes()).unwrap();
+        octets[at] = 'c' as int;
+        assert(!issue.parse_csr(bytes_of(octets)).unwrap().signature_ok);
+    }
+}
+
+@test
+fn generic_sign_envelope_signs_any_der_encodable() {
+    let k = keys.generate(KeyKind.Ed25519).unwrap();
+    let body = der.Asn1.Seq([der.int_of(42)]);
+    let signed = issue.sign_envelope(body, k).unwrap();
+    let kids = der.children(der.parse(signed).unwrap()).unwrap();
+    assert_eq(kids[0].raw, der.encode(der.Asn1.Seq([der.int_of(42)])));
+    let spki = x509.parse_spki(der.parse(keys.spki_der(k).unwrap()).unwrap()).unwrap();
+    let sig = der.as_bits(kids[2]).unwrap();
+    assert(verify.is_valid(verify.signature(oid.ED25519, spki, kids[0].raw, sig)));
+}
+
+@test
+fn issued_pem_is_what_openssl_reads() {
+    let (_, ca) = ca_for(KeyKind.Ed25519);
+    let text = pem.encode("CERTIFICATE", ca.raw);
+    assert(text.starts_with("-----BEGIN CERTIFICATE-----\n"));
+    assert(text.ends_with("-----END CERTIFICATE-----\n"));
+    for line in text.trim().split("\n") {
+        assert(line.len() <= 64);
+    }
+    assert_eq(pem.decode(text).unwrap().der, ca.raw);
+}

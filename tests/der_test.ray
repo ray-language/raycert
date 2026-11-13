@@ -1,0 +1,101 @@
+import der;
+import std/hex;
+import std/time;
+from der import Asn1;
+
+fn h(s: string) -> bytes {
+    hex.hex_decode(s).unwrap()
+}
+
+fn enc(v: Asn1) -> string {
+    hex.hex_encode(der.encode(v))
+}
+
+@test
+fn integers_use_minimal_twos_complement() {
+    assert_eq(enc(der.int_of(0)), "020100");
+    assert_eq(enc(der.int_of(127)), "02017f");
+    assert_eq(enc(der.int_of(128)), "02020080");
+    assert_eq(enc(der.int_of(256)), "02020100");
+    assert_eq(enc(der.int_of(-1)), "0201ff");
+    assert_eq(enc(der.int_of(-128)), "020180");
+    assert_eq(enc(der.int_of(-129)), "0202ff7f");
+    assert_eq(enc(der.uint_of(h("00ff"))), "020200ff");
+    assert_eq(enc(der.uint_of(h("0000017f"))), "0202017f");
+    for n in [0, 1, -1, 127, 128, 255, 65535, -65536, 1 << 40, -(1 << 40)] {
+        let node = der.parse(der.encode(der.int_of(n))).unwrap();
+        assert_eq(der.as_int(node).unwrap(), n);
+    }
+}
+
+@test
+fn lengths_switch_to_long_form_at_128() {
+    assert_eq(hex.hex_encode(der.header(0x04, 127)), "047f");
+    assert_eq(hex.hex_encode(der.header(0x04, 128)), "048180");
+    assert_eq(hex.hex_encode(der.header(0x30, 256)), "30820100");
+    assert_eq(hex.hex_encode(der.header(0x30, 70000)), "3083011170");
+}
+
+@test
+fn oids_round_trip() {
+    assert_eq(hex.hex_encode(der.oid_encode("1.2.840.113549.1.1.11")), "2a864886f70d01010b");
+    assert_eq(hex.hex_encode(der.oid_encode("2.5.29.17")), "551d11");
+    assert_eq(hex.hex_encode(der.oid_encode("2.999.3")), "883703");
+    for o in ["1.3.101.112", "1.2.840.10045.3.1.7", "2.999.3", "1.3.6.1.4.1.11129.2.4.2", "0.9.2342"] {
+        assert_eq(der.oid_decode(der.oid_encode(o)).unwrap(), o);
+    }
+    assert(der.oid_decode(h("2a86")).is_err());
+    assert(der.oid_decode(h("2a8001")).is_err());
+}
+
+@test
+fn the_decoder_is_strict() {
+    assert(der.parse(h("3080020100 0000".replace(" ", ""))).is_err());
+    assert(der.parse(h("3081050201000500")).is_err());
+    assert(der.parse(h("0201")).is_err());
+    assert(der.parse(h("020101ff")).is_err());
+    assert(der.parse(h("02820001ff")).is_err());
+    assert(der.parse(h("1f2200")).is_err());
+    let ok = der.parse(h("3006020101020102")).unwrap();
+    let kids = der.children(ok).unwrap();
+    assert_eq(kids.len(), 2);
+    assert_eq(der.as_int(kids[1]).unwrap(), 2);
+    assert_eq(hex.hex_encode(ok.raw), "3006020101020102");
+}
+
+@test
+fn times_pick_utc_or_generalized_by_year() {
+    let t2049 = time.to_epoch_millis(time.DateTime { year: 2049, month: 12, day: 31, hour: 23, minute: 59, second: 59, weekday: 0 });
+    let t2050 = time.to_epoch_millis(time.DateTime { year: 2050, month: 1, day: 1, hour: 0, minute: 0, second: 0, weekday: 0 });
+    let a = der.encode(Asn1.Time(t2049));
+    let b = der.encode(Asn1.Time(t2050));
+    assert_eq(a[0], der.TAG_UTC_TIME);
+    assert_eq(from_utf8(a.sub_bytes(2, a.len())).unwrap(), "491231235959Z");
+    assert_eq(b[0], der.TAG_GEN_TIME);
+    assert_eq(from_utf8(b.sub_bytes(2, b.len())).unwrap(), "20500101000000Z");
+    assert_eq(der.as_time(der.parse(a).unwrap()).unwrap(), t2049);
+    assert_eq(der.as_time(der.parse(b).unwrap()).unwrap(), t2050);
+    let y1999 = der.parse(der.tlv(der.TAG_UTC_TIME, "990101000000Z".to_bytes())).unwrap();
+    assert_eq(time.from_epoch_millis(der.as_time(y1999).unwrap()).year, 1999);
+    let bad = der.parse(der.tlv(der.TAG_UTC_TIME, "991301000000Z".to_bytes())).unwrap();
+    assert(der.as_time(bad).is_err());
+}
+
+@test
+fn set_of_sorts_by_encoding() {
+    let s = der.encode(Asn1.Set([der.int_of(300), der.int_of(5), der.int_of(1)]));
+    assert_eq(hex.hex_encode(s), "310a0201010201050202012c");
+}
+
+@test
+fn bit_flags_drop_unused_bits() {
+    let n = der.parse(h("03020186")).unwrap();
+    assert_eq(der.bit_flags(n).unwrap(), [true, false, false, false, false, true, true]);
+}
+
+@test
+fn dump_outlines_nested_structures() {
+    let b = der.encode(Asn1.Seq([der.int_of(5), Asn1.Seq([Asn1.Oid("2.5.4.3"), Asn1.Str(der.TAG_UTF8, "hola")]), Asn1.Null]));
+    let text = der.dump(b).unwrap();
+    assert_eq(text, "SEQUENCE (18 octets)\n  INTEGER 5\n  SEQUENCE (11 octets)\n    OID 2.5.4.3\n    UTF8String 'hola'\n  NULL (0 octets)");
+}

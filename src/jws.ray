@@ -18,8 +18,12 @@ pub fn alg(k: PrivKey) -> string {
 /// The public JWK with ONLY the required members, in lexicographic order: rendered compact, it
 /// is exactly the text RFC 7638 hashes for the thumbprint.
 pub fn jwk(k: PrivKey) -> Result<json.Obj, string> {
-    let raw = keys.public_raw(k)?;
-    match (k.kind) {
+    jwk_public(k.kind, keys.public_raw(k)?)
+}
+
+/// The JWK of a raw public key (as `keys.public_raw` returns it).
+pub fn jwk_public(kind: KeyKind, raw: bytes) -> Result<json.Obj, string> {
+    match (kind) {
         KeyKind.Ed25519 => Result.Ok(json.obj().field("crv", "Ed25519").field("kty", "OKP").field("x", base64url(raw))),
         KeyKind.P256 => {
             if (raw.len() != 65 || raw[0] != 4) {
@@ -37,7 +41,11 @@ pub fn jwk(k: PrivKey) -> Result<json.Obj, string> {
 }
 
 pub fn thumbprint(k: PrivKey) -> Result<string, string> {
-    Result.Ok(base64url(crypto.sha256(jwk(k)?.render().to_bytes())))
+    Result.Ok(thumbprint_of(jwk(k)?))
+}
+
+pub fn thumbprint_of(j: json.Obj) -> string {
+    base64url(crypto.sha256(j.render().to_bytes()))
 }
 
 /// The protected header: `jwk` for a new account, `kid` (the account URL) afterwards.

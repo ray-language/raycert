@@ -1,0 +1,148 @@
+import cli;
+import issue;
+import keys;
+import ops;
+import store;
+import x509;
+import std/crypto;
+import std/fs;
+import std/hex;
+import std/time;
+from keys import KeyKind;
+
+fn temp_home() -> string {
+    fs.make_temp_dir("raycert_test_").unwrap()
+}
+
+@test
+fn private_files_and_directories_get_tight_modes() {
+    let home = temp_home();
+    store.private_dir("${home}/secret").unwrap();
+    assert_eq(store.mode_of("${home}/secret").unwrap(), 0o700);
+    store.write_private("${home}/secret/k.pem", "x").unwrap();
+    assert_eq(store.mode_of("${home}/secret/k.pem").unwrap(), 0o600);
+    store.write_atomic("${home}/secret/k2.pem", "y", true).unwrap();
+    assert_eq(store.mode_of("${home}/secret/k2.pem").unwrap(), 0o600);
+    assert(!fs.exists("${home}/secret/k2.pem.tmp"));
+    fs.remove_all(home).unwrap();
+}
+
+@test
+fn meta_round_trips() {
+    let m = store.Meta {
+        name: "web",
+        source: "acme",
+        names: ["a.test", "b.test"],
+        key_kind: "rsa2048",
+        days: 30,
+        directory: "https://localhost:14000/dir",
+        http_port: 5002,
+        http_host: "::",
+    };
+    let back = store.parse_meta(store.meta_json(m)).unwrap();
+    assert_eq(back.names, ["a.test", "b.test"]);
+    assert_eq(back.key_kind, "rsa2048");
+    assert_eq(back.http_port, 5002);
+    assert_eq(back.directory, m.directory);
+    assert(store.check_name("web-1.prod").is_ok());
+    assert(store.check_name("../etc").is_err());
+    assert(store.check_name("a/b").is_err());
+}
+
+fn local_meta(name: string, names: [string], days: int) -> store.Meta {
+    store.Meta { name: name, source: "local", names: names, key_kind: "p256", days: days, directory: "", http_port: 0, http_host: "" }
+}
+
+@test
+fn ca_issue_list_and_renew_with_a_hook() {
+    let home = temp_home();
+    let now = time.now();
+    let o = ops.CaOptions { kind: KeyKind.P256, subject: "CN=Test CA", days: 365, keychain_service: "", force: false };
+    let ca = ops.ca_init(home, o, now).unwrap();
+    assert(ops.ca_init(home, o, now).is_err());
+    assert_eq(store.mode_of("${home}/ca/key.pem").unwrap(), 0o600);
+    assert_eq(store.mode_of("${home}/ca").unwrap(), 0o700);
+
+    ops.issue_local(home, local_meta("short", ["short.test"], 5), Option.None, now).unwrap();
+    ops.issue_local(home, local_meta("long", ["long.test", "127.0.0.1"], 200), Option.None, now).unwrap();
+    assert_eq(store.list_issued(home).unwrap(), ["long", "short"]);
+    assert_eq(store.mode_of("${home}/certs/short/key.pem").unwrap(), 0o600);
+    let chain = ops.load_certs("${home}/certs/short/chain.pem").unwrap();
+    assert_eq(chain.len(), 2);
+    assert_eq(x509.fingerprint_sha256(chain[1]), x509.fingerprint_sha256(ca));
+    let before = x509.fingerprint_sha256(chain[0]);
+
+    let log = "${home}/hook.log";
+    let hook = "echo \"$RAYCERT_NAME $(basename $RAYCERT_CERT)\" >> '${log}'";
+    let results = ops.renew(home, [], 30, false, hook, false, false, now).unwrap();
+    assert_eq(results.len(), 2);
+    assert_eq(results[0].name, "long");
+    assert_eq(results[0].action, "kept");
+    assert_eq(results[1].name, "short");
+    assert_eq(results[1].action, "renewed + hook");
+    assert_eq(fs.read_file(log).unwrap(), "short cert.pem\n");
+    let after = ops.load_certs("${home}/certs/short/cert.pem").unwrap();
+    assert(x509.fingerprint_sha256(after[0]) != before);
+    // Validity is encoded to the second: the new leaf ends 5 days from now, give or take 1 s.
+    let drift = now + 5 * 86400000 - after[0].not_after;
+    assert(drift >= 0 && drift < 1000);
+
+    let failing = ops.renew(home, ["long"], 30, true, "exit 3", false, false, now).unwrap();
+    assert_eq(failing.len(), 1);
+    assert(failing[0].error.contains("exit 3"));
+    fs.remove_all(home).unwrap();
+}
+
+@test
+fn a_csr_is_signed_without_seeing_its_key() {
+    let home = temp_home();
+    let now = time.now();
+    ops.ca_init(home, ops.CaOptions { kind: KeyKind.Ed25519, subject: "CN=CSR CA", days: 30, keychain_service: "", force: false }, now).unwrap();
+    let k = keys.generate(KeyKind.Rsa(2048)).unwrap();
+    let csr = issue.csr(k, ["csr.test"]).unwrap();
+    let dir = ops.issue_local(home, local_meta("ext", [], 10), Option.Some(csr), now).unwrap();
+    assert(!fs.exists("${dir}/key.pem"));
+    let leaf = ops.load_certs("${dir}/cert.pem").unwrap()[0];
+    assert_eq(leaf.spki.raw, keys.spki_der(k).unwrap());
+    assert_eq(x509.sans(leaf).unwrap(), ["DNS:csr.test"]);
+    assert_eq(store.load_meta(home, "ext").unwrap().source, "csr");
+    fs.remove_all(home).unwrap();
+}
+
+@test
+fn the_ca_key_can_live_in_the_keychain() {
+    // Opt-in: touches the system keychain (a throwaway service name, removed at the end).
+    if (env("RAYCERT_TEST_KEYCHAIN").unwrap_or("") != "1") {
+        return;
+    }
+    let home = temp_home();
+    let service = "raycert-test-${hex.hex_encode(crypto.random_bytes(4))}";
+    let now = time.now();
+    ops.ca_init(home, ops.CaOptions { kind: KeyKind.P256, subject: "CN=Keychain CA", days: 30, keychain_service: service, force: false }, now).unwrap();
+    assert(!fs.exists("${home}/ca/key.pem"));
+    match (store.ca_key_ref(home).unwrap()) {
+        store.KeyRef.Keychain(s, _) => assert_eq(s, service),
+        store.KeyRef.File(p) => panic("expected the keychain, got ${p}"),
+    }
+    ops.issue_local(home, local_meta("kc", ["kc.test"], 10), Option.None, now).unwrap();
+    ops.ca_remove(home).unwrap();
+    let account = fs.real_path(home).unwrap() + "/ca";
+    assert(store.load_key(store.KeyRef.Keychain(service, account)).is_err());
+    fs.remove_all(home).unwrap();
+}
+
+@test
+fn arguments_parse_flags_lists_and_switches() {
+    let a = cli.parse(["web", "--san", "a.test,b.test", "--san=c.test", "--days", "7", "--force", "-o", "out.pem", "-v"], ["force", "verbose"]).unwrap();
+    assert_eq(a.positional, ["web"]);
+    assert_eq(cli.list(a, "san"), ["a.test", "b.test", "c.test"]);
+    assert_eq(cli.int_value(a, "days", 90).unwrap(), 7);
+    assert(cli.has(a, "force"));
+    assert(cli.has(a, "verbose"));
+    assert_eq(cli.value(a, "out", ""), "out.pem");
+    assert_eq(cli.unknown(a, ["san", "days", "force", "out", "verbose"]), Option.None);
+    assert_eq(cli.unknown(a, ["san"]), Option.Some("days"));
+    assert(cli.parse(["--days"], []).is_err());
+    assert(cli.parse(["--force=1"], ["force"]).is_err());
+    assert(cli.int_value(cli.parse(["--days", "x"], []).unwrap(), "days", 1).is_err());
+}

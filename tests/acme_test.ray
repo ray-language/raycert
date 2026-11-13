@@ -1,0 +1,313 @@
+import acme;
+import issue;
+import jws;
+import keys;
+import obtain;
+import verify;
+import x509;
+import net/http;
+import net/webserver;
+import std/base64;
+import std/crypto;
+import std/json;
+import std/net;
+import std/pem;
+import std/time;
+from keys import KeyKind, PrivKey;
+
+// A scripted ACME server (RFC 8555 subset) to test the client in-process on both engines: it
+// checks every JWS (signature, nonce, url, jwk vs kid), validates http-01 by fetching the
+// client's responder, and signs the CSR with a throwaway CA. Its state lives in an actor fiber,
+// since handlers only get copies of what they capture.
+
+enum Msg {
+    Put(string, string),
+    Get(string, Channel<string>),
+}
+
+fn state_actor(inbox: Channel<Msg>) {
+    let m: Map<string, string> = Map.new();
+    while (true) {
+        match (recv(inbox)) {
+            Option.Some(msg) => {
+                match (msg) {
+                    Msg.Put(k, v) => m.insert(k, v),
+                    Msg.Get(k, reply) => send(reply, m.get_or(k, "")),
+                }
+            },
+            Option.None => break,
+        }
+    }
+}
+
+fn put(st: Channel<Msg>, k: string, v: string) {
+    send(st, Msg.Put(k, v));
+}
+
+fn lookup(st: Channel<Msg>, k: string) -> string {
+    let reply: Channel<string> = Channel.bounded(1);
+    send(st, Msg.Get(k, reply));
+    recv(reply).unwrap_or("")
+}
+
+fn json_reply(status: int, body: string, nonce: string) -> webserver.Response {
+    var r = webserver.text(status, body);
+    r.headers.insert("Content-Type", "application/json");
+    r.headers.insert("Replay-Nonce", nonce);
+    r
+}
+
+fn problem(status: int, kind: string, detail: string, nonce: string) -> webserver.Response {
+    var r = json_reply(status, json.obj().field("type", "urn:ietf:params:acme:error:${kind}").field("detail", detail).render(), nonce);
+    r.headers.insert("Content-Type", "application/problem+json");
+    r
+}
+
+fn new_nonce(st: Channel<Msg>) -> string {
+    let n = base64.base64url(crypto.random_bytes(12));
+    put(st, "nonce:${n}", "unused");
+    n
+}
+
+/// Checks the JWS of a POST; returns (account thumbprint, payload text).
+fn check_jws(st: Channel<Msg>, req: webserver.Request, base: string) -> Result<(string, string), string> {
+    let body = json.parse(from_utf8(req.body)?)?;
+    let p64 = json.get_string(body, "protected").ok_or("no protected")?;
+    let b64 = json.get_string(body, "payload").ok_or("no payload")?;
+    let sig = base64.base64url_decode(json.get_string(body, "signature").ok_or("no signature")?)?;
+    let header = json.parse(from_utf8(base64.base64url_decode(p64)?)?)?;
+    let nonce = json.get_string(header, "nonce").ok_or("no nonce")?;
+    if (lookup(st, "nonce:${nonce}") != "unused") {
+        return Result.Err("badNonce");
+    }
+    put(st, "nonce:${nonce}", "used");
+    if (json.get_string(header, "url").unwrap_or("") != "${base}${req.path}") {
+        return Result.Err("url mismatch");
+    }
+    if (json.get_string(header, "alg").unwrap_or("") != "ES256") {
+        return Result.Err("only ES256 accounts in this fake");
+    }
+    var x = "";
+    var y = "";
+    var tp = "";
+    match (json.member(header, "jwk")) {
+        Option.Some(j) => {
+            if (json.member(header, "kid").is_some()) {
+                return Result.Err("both jwk and kid");
+            }
+            x = json.get_string(j, "x").unwrap_or("");
+            y = json.get_string(j, "y").unwrap_or("");
+            tp = jws.thumbprint_of(json.obj().field("crv", "P-256").field("kty", "EC").field("x", x).field("y", y));
+            put(st, "acct:${tp}", "${x}.${y}");
+        },
+        Option.None => {
+            let kid = json.get_string(header, "kid").ok_or("no jwk nor kid")?;
+            tp = kid.split("/acct/")[1];
+            let xy = lookup(st, "acct:${tp}").split(".");
+            if (xy.len() != 2) {
+                return Result.Err("accountDoesNotExist");
+            }
+            x = xy[0];
+            y = xy[1];
+        },
+    }
+    let point = bytes_concat([bytes_of([4]), base64.base64url_decode(x)?, base64.base64url_decode(y)?]);
+    if (!crypto.p256_verify(point, "${p64}.${b64}".to_bytes(), sig)) {
+        return Result.Err("bad signature");
+    }
+    let payload = if (b64 == "") { "" } else { from_utf8(base64.base64url_decode(b64)?)? };
+    Result.Ok((tp, payload))
+}
+
+fn token_of(name: string) -> string {
+    base64.base64url(crypto.sha256(name.to_bytes()))
+}
+
+fn validate(st: Channel<Msg>, tp: string, name: string, port: int) -> string {
+    let state = lookup(st, "authz:${name}");
+    if (state == "valid" || lookup(st, "chal:${name}") != "responded") {
+        return if (state == "") { "pending" } else { state };
+    }
+    let tok = token_of(name);
+    match (http.fetch("http://127.0.0.1:${port}/.well-known/acme-challenge/${tok}")) {
+        Result.Ok(r) => {
+            if (r.status == 200 && from_utf8(r.body).unwrap_or("") == "${tok}.${tp}") {
+                put(st, "authz:${name}", "valid");
+                return "valid";
+            }
+            put(st, "authz:${name}", "invalid");
+            "invalid"
+        },
+        Result.Err(_) => "pending",
+    }
+}
+
+fn handle(st: Channel<Msg>, base: string, http_port: int, ca_pem: string, req: webserver.Request) -> webserver.Response {
+    if (req.path == "/dir") {
+        let d = json.obj().field("newNonce", "${base}/nonce").field("newAccount", "${base}/acct").field("newOrder", "${base}/order").render();
+        return json_reply(200, d, new_nonce(st));
+    }
+    if (req.path == "/nonce") {
+        return json_reply(200, "", new_nonce(st));
+    }
+    let checked = check_jws(st, req, base);
+    let nonce = new_nonce(st);
+    let (tp, payload) = match (checked) {
+        Result.Ok(v) => v,
+        Result.Err(e) => {
+            if (e == "badNonce") {
+                return problem(400, "badNonce", "stale nonce", nonce);
+            }
+            return problem(400, "malformed", e, nonce);
+        },
+    };
+    if (req.path == "/acct") {
+        var r = json_reply(201, "{\"status\":\"valid\"}", nonce);
+        r.headers.insert("Location", "${base}/acct/${tp}");
+        return r;
+    }
+    if (req.path == "/order") {
+        var names: [string] = [];
+        for id in json.get_array(json.parse(payload).unwrap(), "identifiers").unwrap_or([]) {
+            names.push(json.get_string(id, "value").unwrap_or(""));
+        }
+        put(st, "order", names.join(","));
+        var r = json_reply(201, order_json(st, base, tp, names, http_port), nonce);
+        r.headers.insert("Location", "${base}/order/1");
+        return r;
+    }
+    if (req.path == "/order/1") {
+        return json_reply(200, order_json(st, base, tp, lookup(st, "order").split(","), http_port), nonce);
+    }
+    if (req.path.starts_with("/authz/")) {
+        let name = req.path.substring(7, req.path.len());
+        let status = validate(st, tp, name, http_port);
+        let ch = json.obj().field("type", "http-01").field("url", "${base}/chal/${name}").field("token", token_of(name)).field("status", status);
+        let body = json.obj().field("status", status).field("identifier", json.obj().field("type", "dns").field("value", name)).field("challenges", json.arr().item(ch)).render();
+        return json_reply(200, body, nonce);
+    }
+    if (req.path.starts_with("/chal/")) {
+        put(st, "chal:${req.path.substring(6, req.path.len())}", "responded");
+        return json_reply(200, "{}", nonce);
+    }
+    if (req.path == "/finalize/1") {
+        let csr_der = base64.base64url_decode(json.get_string(json.parse(payload).unwrap(), "csr").unwrap_or("")).unwrap();
+        match (sign_csr(ca_pem, csr_der)) {
+            Result.Ok(chain) => put(st, "cert", chain),
+            Result.Err(e) => return problem(400, "badCSR", e, nonce),
+        }
+        return json_reply(200, order_json(st, base, tp, lookup(st, "order").split(","), http_port), nonce);
+    }
+    if (req.path == "/cert/1") {
+        var r = json_reply(200, lookup(st, "cert"), nonce);
+        r.headers.insert("Content-Type", "application/pem-certificate-chain");
+        return r;
+    }
+    problem(404, "malformed", "no route ${req.path}", nonce)
+}
+
+fn order_json(st: Channel<Msg>, base: string, tp: string, names: [string], port: int) -> string {
+    var authzs = json.arr();
+    var all_valid = true;
+    for n in names {
+        authzs = authzs.item("${base}/authz/${n}");
+        if (validate(st, tp, n, port) != "valid") {
+            all_valid = false;
+        }
+    }
+    let has_cert = lookup(st, "cert") != "";
+    let status = if (has_cert) { "valid" } else if (all_valid) { "ready" } else { "pending" };
+    var o = json.obj().field("status", status).field("authorizations", authzs).field("finalize", "${base}/finalize/1");
+    if (has_cert) {
+        o = o.field("certificate", "${base}/cert/1");
+    }
+    o.render()
+}
+
+fn sign_csr(ca_pem: string, csr_der: bytes) -> Result<string, string> {
+    let ca_key = keys.from_pem(ca_pem)?;
+    let ca = x509.parse(pem.decode_label(ca_pem, "CERTIFICATE")?)?;
+    let c = issue.parse_csr(csr_der)?;
+    if (!c.signature_ok) {
+        return Result.Err("CSR signature");
+    }
+    var names: [string] = [];
+    for n in c.names {
+        names.push(n.strip_prefix("DNS:").unwrap_or(n));
+    }
+    let req = issue.LeafRequest { subject: x509.Name { rdns: [] }, spki: c.spki.raw, names: names, days: 30 };
+    let leaf = issue.leaf(req, ca_key, ca, time.now())?;
+    Result.Ok(pem.encode("CERTIFICATE", leaf) + pem.encode("CERTIFICATE", ca.raw))
+}
+
+fn free_port() -> int {
+    let l = net.tcp_listen("127.0.0.1", 0).unwrap();
+    let p = net.local_port(l);
+    close(l);
+    p
+}
+
+// One @test: OS listeners survive half-dead between tests.
+@test
+fn obtains_a_certificate_from_a_scripted_acme_server() {
+    let ca_key = keys.generate(KeyKind.P256).unwrap();
+    let ca_der = issue.self_signed_ca(ca_key, x509.cn_name("Fake ACME CA"), time.now(), 30).unwrap();
+    let ca_pem = keys.to_pem(ca_key) + pem.encode("CERTIFICATE", ca_der);
+    let listener = net.tcp_listen("127.0.0.1", 0).unwrap();
+    let base = "http://127.0.0.1:${net.local_port(listener)}";
+    let http_port = free_port();
+    let st: Channel<Msg> = Channel.new();
+    let stop: Channel<int> = Channel.new();
+    spawn(fn() { state_actor(st); });
+    let server = spawn(fn() -> Result<int, string> {
+        webserver.serve_options_on(listener, webserver.options().with_stop(stop).quiet(), fn() -> fn(webserver.Request) -> webserver.Response {
+            let s = st;
+            let b = base;
+            let hp = http_port;
+            let cp = ca_pem;
+            fn(req: webserver.Request) -> webserver.Response { handle(s, b, hp, cp, req) }
+        })
+    });
+    let p = obtain.Params {
+        directory: "${base}/dir",
+        names: ["one.test", "two.test"],
+        email: "ops@example.test",
+        http_host: "127.0.0.1",
+        http_port: http_port,
+        insecure: false,
+        verbose: false,
+        timeout_ms: 15000,
+    };
+    let account = keys.generate(KeyKind.P256).unwrap();
+    let cert_key = keys.generate(KeyKind.Ed25519).unwrap();
+    let result = obtain.obtain(p, account, cert_key);
+    // A nonce the server never issued gets badNonce; post() retries once with a fresh one.
+    let c = acme.connect("${base}/dir", account, false, false).unwrap();
+    acme.account(c, "").unwrap();
+    c.nonce = "never-issued";
+    let again = acme.post(c, "${base}/order/1", "");
+    close(stop);
+    join(server).unwrap();
+    close(st);
+    let chain = result.unwrap();
+    assert_eq(chain.len(), 2);
+    let leaf = x509.parse(chain[0]).unwrap();
+    let ca = x509.parse(chain[1]).unwrap();
+    assert_eq(x509.sans(leaf).unwrap(), ["DNS:one.test", "DNS:two.test"]);
+    assert_eq(leaf.spki.raw, keys.spki_der(cert_key).unwrap());
+    assert(verify.is_valid(verify.cert_signed_by(leaf, ca)));
+    assert_eq(again.unwrap().status, 200);
+}
+
+@test
+fn acme_documents_parse() {
+    let o = acme.order_of("u", json.parse("{\"status\":\"invalid\",\"authorizations\":[\"a\",\"b\"],\"finalize\":\"f\",\"error\":{\"type\":\"urn:ietf:params:acme:error:rejectedIdentifier\",\"detail\":\"no\"}}").unwrap());
+    assert_eq(o.status, "invalid");
+    assert_eq(o.authorizations, ["a", "b"]);
+    assert_eq(o.problem, "urn:ietf:params:acme:error:rejectedIdentifier: no");
+    let a = acme.authz_of(json.parse("{\"status\":\"pending\",\"identifier\":{\"type\":\"dns\",\"value\":\"x.test\"},\"challenges\":[{\"type\":\"dns-01\",\"url\":\"d\",\"token\":\"t1\"},{\"type\":\"http-01\",\"url\":\"h\",\"token\":\"t2\",\"status\":\"pending\"}]}").unwrap());
+    assert_eq(a.identifier, "x.test");
+    assert_eq(acme.http01(a).unwrap().token, "t2");
+    assert_eq(acme.problem_text("{\"type\":\"urn:ietf:params:acme:error:badNonce\",\"detail\":\"stale\"}".to_bytes()), "badNonce: stale");
+    assert_eq(acme.problem_text("plain".to_bytes()), "plain");
+}

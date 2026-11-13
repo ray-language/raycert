@@ -1,0 +1,89 @@
+import ops;
+import tlsprobe;
+from tlsprobe import Flight;
+
+fn u24(n: int) -> [int] {
+    [(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff]
+}
+
+fn zeros(n: int) -> [int] {
+    var out: [int] = [];
+    while (out.len() < n) {
+        out.push(0);
+    }
+    out
+}
+
+fn record(kind: int, body: bytes) -> bytes {
+    bytes_concat([bytes_of([kind, 3, 3, (body.len() >> 8) & 0xff, body.len() & 0xff]), body])
+}
+
+fn handshake(kind: int, body: bytes) -> bytes {
+    bytes_concat([bytes_of([kind] + u24(body.len())), body])
+}
+
+fn certificate_msg(certs: [bytes]) -> bytes {
+    var parts: [bytes] = [];
+    var total = 0;
+    for c in certs {
+        parts.push(bytes_of(u24(c.len())));
+        parts.push(c);
+        total = total + 3 + c.len();
+    }
+    bytes_concat([bytes_of(u24(total))] + parts)
+}
+
+@test
+fn client_hello_is_a_tls12_record_with_sni() {
+    let ch = tlsprobe.client_hello("example.test");
+    assert_eq(ch[0], 22);
+    assert_eq((ch[3] << 8) | ch[4], ch.len() - 5);
+    assert_eq(ch[5], 1);
+    assert_eq(ch[9], 3);
+    assert_eq(ch[10], 3);
+    assert(ch.index_of("example.test".to_bytes()).is_some());
+    let by_ip = tlsprobe.client_hello("127.0.0.1");
+    assert(by_ip.index_of("127.0.0.1".to_bytes()).is_none());
+}
+
+@test
+fn the_certificate_message_is_found_across_records_and_chunks() {
+    let certs = ops.load_certs("tests/fixtures/pebble-chain.pem").unwrap();
+    let server_hello = handshake(2, bytes_of([3, 3] + zeros(34)));
+    let cert = handshake(11, certificate_msg([certs[0].raw, certs[1].raw]));
+    let hs = bytes_concat([server_hello, cert]);
+    // Split the handshake stream over two records, and the records over odd-sized chunks.
+    let cut = 100;
+    let wire = bytes_concat([record(22, hs.sub_bytes(0, cut)), record(22, hs.sub_bytes(cut, hs.len()))]);
+    let r = tlsprobe.reader();
+    var off = 0;
+    var got: [bytes] = [];
+    while (off < wire.len()) {
+        let end = if (off + 37 < wire.len()) { off + 37 } else { wire.len() };
+        match (tlsprobe.feed(r, wire.sub_bytes(off, end)).unwrap()) {
+            Option.Some(Flight.Chain(cs)) => got = cs,
+            Option.Some(_) => panic("unexpected flight"),
+            Option.None => {},
+        }
+        off = end;
+    }
+    assert_eq(got.len(), 2);
+    assert_eq(got[0], certs[0].raw);
+    assert_eq(got[1], certs[1].raw);
+}
+
+@test
+fn alerts_and_tls13_answers_are_reported() {
+    let r = tlsprobe.reader();
+    match (tlsprobe.feed(r, record(21, bytes_of([2, 70]))).unwrap()) {
+        Option.Some(Flight.Alert(level, desc)) => assert_eq(tlsprobe.alert_text(level, desc), "fatal protocol_version"),
+        _ => panic("expected an alert"),
+    }
+    let r2 = tlsprobe.reader();
+    let hello13 = handshake(2, bytes_of([3, 4] + zeros(34)));
+    match (tlsprobe.feed(r2, record(22, hello13)).unwrap()) {
+        Option.Some(Flight.NotTls12(_)) => {},
+        _ => panic("expected NotTls12"),
+    }
+    assert(tlsprobe.parse_certificate_msg(bytes_of([0, 0, 9, 0, 0, 1, 7])).is_err());
+}

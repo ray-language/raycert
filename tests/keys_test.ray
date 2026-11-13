@@ -1,0 +1,123 @@
+import jws;
+import keys;
+import std/base64;
+import std/crypto;
+import std/hex;
+import std/json;
+from keys import KeyKind;
+
+// RFC 8410 §10.3 — the example Ed25519 private key (a published test vector, not a secret).
+const RFC8410_PEM: string = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC\n-----END PRIVATE KEY-----\n";
+
+@test
+fn ed25519_pkcs8_matches_rfc_8410() {
+    let seed = hex.hex_decode("d4ee72dbf913584ad5b6d8f1f769f8ad3afe7c28cbf1d4fbe097a88f44755842").unwrap();
+    let k = keys.from_pem(RFC8410_PEM).unwrap();
+    assert_eq(keys.kind_name(k.kind), "ed25519");
+    assert_eq(keys.ed25519_seed(k).unwrap(), seed);
+    assert_eq(keys.to_pem(keys.PrivKey { kind: KeyKind.Ed25519, pkcs8: keys.ed25519_pkcs8(seed) }), RFC8410_PEM);
+    assert_eq(hex.hex_encode(keys.public_raw(k).unwrap()), "19bf44096984cdfe8541bac167dc3b96c85086aa30b6b6cb0c5c38ad703166e1");
+}
+
+@test
+fn generated_keys_round_trip_through_pem() {
+    for kind in [KeyKind.Ed25519, KeyKind.P256, KeyKind.Rsa(2048)] {
+        let k = keys.generate(kind).unwrap();
+        let back = keys.from_pem(keys.to_pem(k)).unwrap();
+        assert_eq(keys.kind_name(back.kind), keys.kind_name(kind));
+        assert_eq(keys.public_raw(back).unwrap(), keys.public_raw(k).unwrap());
+    }
+}
+
+@test
+fn legacy_and_unknown_pem_labels_are_refused_clearly() {
+    let legacy = "-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n";
+    let e = keys.from_pem(legacy).unwrap_err_text();
+    assert(e.contains("openssl pkcs8 -topk8"));
+    assert(keys.from_pem("nothing here").is_err());
+    assert(keys.parse_kind("dsa").is_err());
+    assert_eq(keys.kind_name(keys.parse_kind("RSA4096").unwrap()), "rsa4096");
+}
+
+fn unwrap_err_text(r: Result<keys.PrivKey, string>) -> string {
+    match (r) {
+        Result.Ok(_) => "",
+        Result.Err(e) => e,
+    }
+}
+
+@test
+fn ecdsa_signatures_convert_between_raw_and_der() {
+    var raw: [int] = [];
+    var i = 0;
+    while (i < 64) {
+        raw.push(if (i == 0 || i == 32) { 0x80 } else if (i < 3) { 0 } else { i });
+        i = i + 1;
+    }
+    let rs = bytes_of(raw);
+    let d = keys.ecdsa_der(rs);
+    assert_eq(d[0], 0x30);
+    assert_eq(d[3], 33);
+    assert_eq(keys.ecdsa_raw(d, 32).unwrap(), rs);
+    let small = bytes_concat([bytes_of([0, 0, 1]), crypto.random_bytes(29), bytes_of([0, 0, 0, 5]), crypto.random_bytes(28)]);
+    assert_eq(keys.ecdsa_raw(keys.ecdsa_der(small), 32).unwrap(), small);
+}
+
+@test
+fn p256_x509_signatures_verify_as_asn1() {
+    let k = keys.generate(KeyKind.P256).unwrap();
+    let msg = "to be signed".to_bytes();
+    let sig = keys.sign_x509(k, msg).unwrap();
+    assert(crypto.p256_verify_asn1(keys.public_raw(k).unwrap(), msg, sig));
+    let jsig = keys.sign_jws(k, msg).unwrap();
+    assert_eq(jsig.len(), 64);
+    assert(crypto.p256_verify(keys.public_raw(k).unwrap(), msg, jsig));
+}
+
+@test
+fn rfc_7638_thumbprint_example() {
+    let n = base64.base64url_decode("0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw").unwrap();
+    let e = base64.base64url_decode("AQAB").unwrap();
+    let j = jws.jwk_public(KeyKind.Rsa(2048), crypto.rsa_public_key(n, e)).unwrap();
+    assert_eq(jws.thumbprint_of(j), "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs");
+}
+
+fn segment(text: string, key: string) -> string {
+    json.get_string(json.parse(text).unwrap(), key).unwrap()
+}
+
+@test
+fn jws_signatures_verify_for_every_algorithm() {
+    for kind in [KeyKind.Ed25519, KeyKind.P256, KeyKind.Rsa(2048)] {
+        let k = keys.generate(kind).unwrap();
+        let prot = jws.protected(k, "", "nonce-1", "https://acme.test/new-acct").unwrap();
+        let body = jws.sign(k, prot, "{\"termsOfServiceAgreed\":true}").unwrap();
+        let p64 = segment(body, "protected");
+        let b64 = segment(body, "payload");
+        let sig = base64.base64url_decode(segment(body, "signature")).unwrap();
+        let header = json.parse(from_utf8(base64.base64url_decode(p64).unwrap()).unwrap()).unwrap();
+        assert_eq(json.get_string(header, "alg").unwrap(), jws.alg(k));
+        assert(json.member(header, "jwk").is_some());
+        assert(json.member(header, "kid").is_none());
+        let signed = "${p64}.${b64}".to_bytes();
+        let pubkey = keys.public_raw(k).unwrap();
+        let ok = match (kind) {
+            KeyKind.Ed25519 => crypto.ed25519_verify(pubkey, signed, sig),
+            KeyKind.P256 => crypto.p256_verify(pubkey, signed, sig),
+            KeyKind.Rsa(_) => crypto.rsa_pkcs1_verify(pubkey, signed, sig),
+        };
+        assert(ok);
+    }
+}
+
+@test
+fn post_as_get_has_an_empty_payload_and_a_kid() {
+    let k = keys.generate(KeyKind.P256).unwrap();
+    let body = jws.sign(k, jws.protected(k, "https://acme.test/acct/1", "n", "https://acme.test/order/1").unwrap(), "").unwrap();
+    assert_eq(segment(body, "payload"), "");
+    let header = json.parse(from_utf8(base64.base64url_decode(segment(body, "protected")).unwrap()).unwrap()).unwrap();
+    assert_eq(json.get_string(header, "kid").unwrap(), "https://acme.test/acct/1");
+    assert(json.member(header, "jwk").is_none());
+    let ka = jws.key_authorization(k, "tok").unwrap();
+    assert_eq(ka, "tok.${jws.thumbprint(k).unwrap()}");
+}
