@@ -1,0 +1,369 @@
+//! Building and signing: TBSCertificate, the certificate around it, PKCS#10 requests, and the
+//! v3 extensions a development CA needs.
+
+import der;
+import keys;
+import oid;
+import verify;
+import x509;
+import std/crypto;
+from der import Asn1, DerEncode, Node;
+from keys import PrivKey;
+from x509 import AlgId, Ext, Name;
+
+/// TBSCertificate (always v3). `spki` is the SubjectPublicKeyInfo DER as is.
+pub struct Tbs {
+    serial: bytes,
+    sig: AlgId,
+    issuer: Name,
+    not_before: int,
+    not_after: int,
+    subject: Name,
+    spki: bytes,
+    exts: [Ext],
+}
+
+impl DerEncode for Tbs {
+    fn to_der(self) -> bytes {
+        var items: [Asn1] = [
+            Asn1.Explicit(0, der.int_of(2)),
+            der.uint_of(self.serial),
+            Asn1.Raw(self.sig.to_der()),
+            Asn1.Raw(self.issuer.to_der()),
+            Asn1.Seq([Asn1.Time(self.not_before), Asn1.Time(self.not_after)]),
+            Asn1.Raw(self.subject.to_der()),
+            Asn1.Raw(self.spki),
+        ];
+        if (self.exts.len() > 0) {
+            items.push(Asn1.Explicit(3, Asn1.Raw(der.seq_of(self.exts))));
+        }
+        der.encode(Asn1.Seq(items))
+    }
+}
+
+/// Anything that is signed the X.509 way: `SEQUENCE { body, algorithm, BIT STRING signature }`.
+/// Both TBSCertificate and CertificationRequestInfo go through this one generic function.
+pub fn sign_envelope<T: DerEncode>(body: T, key: PrivKey) -> Result<bytes, string> {
+    let tbs = body.to_der();
+    let sig = keys.sign_x509(key, tbs)?;
+    Result.Ok(der.encode(Asn1.Seq([Asn1.Raw(tbs), Asn1.Raw(keys.sig_alg(key).to_der()), Asn1.BitStr(sig)])))
+}
+
+/// A positive 127-bit random serial (RFC 5280 allows up to 20 octets; CAs use ≥ 64 random bits).
+pub fn random_serial() -> bytes {
+    let r = crypto.random_bytes(16);
+    var octets: [int] = [];
+    for o in r {
+        octets.push(o);
+    }
+    octets[0] = (octets[0] & 0x7f) | 0x01;
+    bytes_of(octets)
+}
+
+// ---------------------------------------------------------------- extensions
+
+pub fn basic_constraints(ca: bool, path_len: int) -> Ext {
+    var items: [Asn1] = [];
+    if (ca) {
+        items.push(Asn1.Bool(true));
+        if (path_len >= 0) {
+            items.push(der.int_of(path_len));
+        }
+    }
+    Ext { oid: oid.BASIC_CONSTRAINTS, critical: true, value: der.encode(Asn1.Seq(items)) }
+}
+
+/// KeyUsage from bit numbers (0 = digitalSignature, 2 = keyEncipherment, 5 = keyCertSign,
+/// 6 = cRLSign), as a DER BIT STRING without trailing zero bits.
+pub fn key_usage(bits: [int]) -> Ext {
+    var top = 0;
+    for b in bits {
+        if (b > top) {
+            top = b;
+        }
+    }
+    let nbytes = top / 8 + 1;
+    var octets: [int] = [];
+    var i = 0;
+    while (i < nbytes) {
+        octets.push(0);
+        i = i + 1;
+    }
+    for b in bits {
+        octets[b / 8] = octets[b / 8] | (0x80 >> (b % 8));
+    }
+    let unused = 7 - (top % 8);
+    let content = bytes_concat([bytes_of([unused]), bytes_of(octets)]);
+    Ext { oid: oid.KEY_USAGE, critical: true, value: der.tlv(der.TAG_BIT_STRING, content) }
+}
+
+pub fn ext_key_usage(oids: [string]) -> Ext {
+    var items: [Asn1] = [];
+    for o in oids {
+        items.push(Asn1.Oid(o));
+    }
+    Ext { oid: oid.EXT_KEY_USAGE, critical: false, value: der.encode(Asn1.Seq(items)) }
+}
+
+/// SubjectAltName from `example.com`, `*.example.com`, `127.0.0.1`, `::1` (IPs are detected).
+pub fn subject_alt_name(names: [string]) -> Result<Ext, string> {
+    var items: [Asn1] = [];
+    for n in names {
+        match (parse_ip(n)) {
+            Option.Some(ip) => items.push(Asn1.Implicit(7, ip)),
+            Option.None => {
+                check_dns_name(n)?;
+                items.push(Asn1.Implicit(2, n.to_lower().to_bytes()));
+            },
+        }
+    }
+    Result.Ok(Ext { oid: oid.SUBJECT_ALT_NAME, critical: false, value: der.encode(Asn1.Seq(items)) })
+}
+
+pub fn check_dns_name(n: string) -> Result<int, string> {
+    if (n.len() == 0 || n.len() > 253) {
+        return Result.Err("'${n}' is not a DNS name");
+    }
+    var first = true;
+    for label in n.split(".") {
+        let ok_wild = first && label == "*";
+        if (!ok_wild) {
+            if (label.len() == 0 || label.len() > 63 || label.starts_with("-") || label.ends_with("-")) {
+                return Result.Err("'${n}' is not a DNS name");
+            }
+            for c in label.chars() {
+                let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-';
+                if (!ok) {
+                    return Result.Err("'${n}' is not a DNS name (character '${c}')");
+                }
+            }
+        }
+        first = false;
+    }
+    Result.Ok(0)
+}
+
+/// IPv4 dotted quad or IPv6 (with `::`) → 4 or 16 octets.
+pub fn parse_ip(s: string) -> Option<bytes> {
+    if (s.contains(":")) {
+        return parse_ipv6(s);
+    }
+    let parts = s.split(".");
+    if (parts.len() != 4) {
+        return Option.None;
+    }
+    var out: [int] = [];
+    for p in parts {
+        if (p.len() == 0 || p.len() > 3) {
+            return Option.None;
+        }
+        for c in p.chars() {
+            if (c < '0' || c > '9') {
+                return Option.None;
+            }
+        }
+        let v = parse_int(p)?;
+        if (v > 255) {
+            return Option.None;
+        }
+        out.push(v);
+    }
+    Option.Some(bytes_of(out))
+}
+
+fn parse_ipv6(s: string) -> Option<bytes> {
+    let halves = s.split("::");
+    if (halves.len() > 2) {
+        return Option.None;
+    }
+    let head = groups6(halves[0])?;
+    var tail: [int] = [];
+    if (halves.len() == 2) {
+        tail = groups6(halves[1])?;
+    }
+    let missing = 8 - head.len() - tail.len();
+    if (missing < 0 || (halves.len() == 1 && missing != 0) || (halves.len() == 2 && missing < 1)) {
+        return Option.None;
+    }
+    var all = head;
+    var i = 0;
+    while (i < missing) {
+        all.push(0);
+        i = i + 1;
+    }
+    all = all + tail;
+    var out: [int] = [];
+    for g in all {
+        out.push(g >> 8);
+        out.push(g & 0xff);
+    }
+    Option.Some(bytes_of(out))
+}
+
+fn groups6(s: string) -> Option<[int]> {
+    var out: [int] = [];
+    if (s.len() == 0) {
+        return Option.Some(out);
+    }
+    for g in s.split(":") {
+        if (g.len() == 0 || g.len() > 4) {
+            return Option.None;
+        }
+        var v = 0;
+        for c in g.to_lower().chars() {
+            let d = "0123456789abcdef".index_of("${c}")?;
+            v = v * 16 + d;
+        }
+        out.push(v);
+    }
+    Option.Some(out)
+}
+
+/// The key identifier of RFC 5280 §4.2.1.2 method 1: SHA-1 of the subjectPublicKey bits.
+pub fn key_id(spki: bytes) -> Result<bytes, string> {
+    let s = x509.parse_spki(der.parse(spki)?)?;
+    Result.Ok(crypto.sha1(s.key))
+}
+
+pub fn subject_key_id(id: bytes) -> Ext {
+    Ext { oid: oid.SUBJECT_KEY_ID, critical: false, value: der.encode(Asn1.OctStr(id)) }
+}
+
+pub fn authority_key_id(id: bytes) -> Ext {
+    Ext { oid: oid.AUTHORITY_KEY_ID, critical: false, value: der.encode(Asn1.Seq([Asn1.Implicit(0, id)])) }
+}
+
+// ---------------------------------------------------------------- certificates
+
+/// A self-signed CA certificate.
+pub fn self_signed_ca(key: PrivKey, subject: Name, now: int, days: int) -> Result<bytes, string> {
+    let spki = keys.spki_der(key)?;
+    let id = key_id(spki)?;
+    let tbs = Tbs {
+        serial: random_serial(),
+        sig: keys.sig_alg(key),
+        issuer: subject,
+        not_before: now - 3600000,
+        not_after: now + days * 86400000,
+        subject: subject,
+        spki: spki,
+        exts: [basic_constraints(true, 0), key_usage([0, 5, 6]), subject_key_id(id)],
+    };
+    sign_envelope(tbs, key)
+}
+
+/// What a leaf certificate asks for: its subject key, names and lifetime.
+pub struct LeafRequest {
+    subject: Name,
+    spki: bytes,
+    names: [string],
+    days: int,
+}
+
+/// A TLS server (and client) certificate for `req`, signed by the CA.
+pub fn leaf(req: LeafRequest, ca_key: PrivKey, ca: x509.Cert, now: int) -> Result<bytes, string> {
+    let spki_node = x509.parse_spki(der.parse(req.spki)?)?;
+    // keyEncipherment only makes sense for RSA keys (TLS 1.2 RSA key exchange).
+    let usage = if (spki_node.alg == oid.RSA_ENCRYPTION) { [0, 2] } else { [0] };
+    var exts: [Ext] = [basic_constraints(false, -1), key_usage(usage), ext_key_usage([oid.SERVER_AUTH, oid.CLIENT_AUTH])];
+    if (req.names.len() > 0) {
+        exts.push(subject_alt_name(req.names)?);
+    }
+    exts.push(subject_key_id(key_id(req.spki)?));
+    let aki = match (x509.subject_key_id(ca)) {
+        Option.Some(id) => id,
+        Option.None => key_id(ca.spki.raw)?,
+    };
+    exts.push(authority_key_id(aki));
+    var not_after = now + req.days * 86400000;
+    if (not_after > ca.not_after) {
+        not_after = ca.not_after;
+    }
+    let tbs = Tbs {
+        serial: random_serial(),
+        sig: keys.sig_alg(ca_key),
+        issuer: ca.subject,
+        not_before: now - 3600000,
+        not_after: not_after,
+        subject: req.subject,
+        spki: req.spki,
+        exts: exts,
+    };
+    sign_envelope(tbs, ca_key)
+}
+
+// ---------------------------------------------------------------- PKCS#10
+
+pub struct RequestInfo {
+    subject: Name,
+    spki: bytes,
+    exts: [Ext],
+}
+
+impl DerEncode for RequestInfo {
+    fn to_der(self) -> bytes {
+        var attrs: [Asn1] = [];
+        if (self.exts.len() > 0) {
+            attrs.push(Asn1.Seq([Asn1.Oid(oid.EXTENSION_REQUEST), Asn1.Set([Asn1.Raw(der.seq_of(self.exts))])]));
+        }
+        der.encode(Asn1.Seq([
+            der.int_of(0),
+            Asn1.Raw(self.subject.to_der()),
+            Asn1.Raw(self.spki),
+            Asn1.ImplicitSeq(0, attrs),
+        ]))
+    }
+}
+
+/// A CSR for `names` (the first one is also the CN), signed by `key`.
+pub fn csr(key: PrivKey, names: [string]) -> Result<bytes, string> {
+    if (names.len() == 0) {
+        return Result.Err("a CSR needs at least one name");
+    }
+    let info = RequestInfo {
+        subject: x509.cn_name(names[0]),
+        spki: keys.spki_der(key)?,
+        exts: [subject_alt_name(names)?],
+    };
+    sign_envelope(info, key)
+}
+
+/// A parsed CSR: subject, key, requested names, and whether its self-signature holds.
+pub struct Csr {
+    subject: Name,
+    spki: x509.Spki,
+    names: [string],
+    signature_ok: bool,
+}
+
+pub fn parse_csr(b: bytes) -> Result<Csr, string> {
+    let top = der.expect(der.parse(b)?, der.TAG_SEQUENCE, "CertificationRequest")?;
+    if (top.len() != 3) {
+        return Result.Err("CertificationRequest with ${top.len()} elements");
+    }
+    let info = der.expect(top[0], der.TAG_SEQUENCE, "CertificationRequestInfo")?;
+    if (info.len() < 3) {
+        return Result.Err("CertificationRequestInfo with ${info.len()} elements");
+    }
+    let subject = x509.parse_name(info[1])?;
+    let spki = x509.parse_spki(info[2])?;
+    var names: [string] = [];
+    if (info.len() > 3 && info[3].tag == 0xa0) {
+        for attr in der.children(info[3])? {
+            let kv = der.expect(attr, der.TAG_SEQUENCE, "Attribute")?;
+            if (kv.len() == 2 && der.as_oid(kv[0])? == oid.EXTENSION_REQUEST) {
+                for set_item in der.expect(kv[1], der.TAG_SET, "extensionRequest values")? {
+                    for e in x509.parse_exts(set_item)? {
+                        if (e.oid == oid.SUBJECT_ALT_NAME) {
+                            names = names + x509.general_names(e.value)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let a = x509.parse_alg(top[1])?;
+    let sig = der.as_bits(top[2])?;
+    let ok = verify.is_valid(verify.signature(a.oid, spki, top[0].raw, sig));
+    Result.Ok(Csr { subject: subject, spki: spki, names: names, signature_ok: ok })
+}

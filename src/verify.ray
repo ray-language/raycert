@@ -1,0 +1,114 @@
+//! Signature checks: a certificate (or CSR) signature against a SubjectPublicKeyInfo, and a
+//! whole chain link by link, limited to what std/crypto can verify.
+
+import oid;
+import x509;
+import std/crypto;
+from x509 import Cert, Spki;
+
+pub enum Check {
+    Valid,
+    Invalid(string),
+    Unsupported(string),
+}
+
+pub fn check_text(c: Check) -> string {
+    match (c) {
+        Check.Valid => "valid",
+        Check.Invalid(why) => "INVALID (${why})",
+        Check.Unsupported(why) => "not checked (${why})",
+    }
+}
+
+pub fn is_valid(c: Check) -> bool {
+    match (c) {
+        Check.Valid => true,
+        _ => false,
+    }
+}
+
+/// Does `sig` over `msg`, made with algorithm `alg`, verify under `key`?
+pub fn signature(alg: string, key: Spki, msg: bytes, sig: bytes) -> Check {
+    if (alg == oid.SHA256_WITH_RSA) {
+        if (key.alg != oid.RSA_ENCRYPTION) {
+            return Check.Invalid("RSA signature, ${oid.name(key.alg)} key");
+        }
+        return verdict(crypto.rsa_pkcs1_verify(key.key, msg, sig), "RSA PKCS#1 v1.5");
+    }
+    if (alg == oid.ECDSA_SHA256) {
+        if (key.alg != oid.EC_PUBLIC_KEY) {
+            return Check.Invalid("ECDSA signature, ${oid.name(key.alg)} key");
+        }
+        if (key.curve != oid.P256) {
+            return Check.Unsupported("ecdsa-with-SHA256 on ${oid.name(key.curve)}: std/crypto verifies only P-256");
+        }
+        return verdict(crypto.p256_verify_asn1(key.key, msg, sig), "ECDSA P-256");
+    }
+    if (alg == oid.ED25519) {
+        if (key.alg != oid.ED25519) {
+            return Check.Invalid("Ed25519 signature, ${oid.name(key.alg)} key");
+        }
+        return verdict(crypto.ed25519_verify(key.key, msg, sig), "Ed25519");
+    }
+    let why = "${oid.name(alg)}${if (key.curve != "") { " on " + oid.name(key.curve) } else { "" }}: std/crypto has no verifier for it";
+    Check.Unsupported(why)
+}
+
+fn verdict(ok: bool, what: string) -> Check {
+    if (ok) { Check.Valid } else { Check.Invalid("${what} signature does not verify") }
+}
+
+/// The signature of `c` under `issuer`'s key (also checks the outer and inner algorithms agree).
+pub fn cert_signed_by(c: Cert, issuer: Cert) -> Check {
+    if (c.sig_alg.oid != c.tbs_sig.oid) {
+        return Check.Invalid("signatureAlgorithm differs from the TBS signature field");
+    }
+    signature(c.sig_alg.oid, issuer.spki, c.tbs, c.signature)
+}
+
+pub struct Link {
+    subject: string,
+    issuer: string,
+    check: Check,
+    name_ok: bool,
+}
+
+/// Each certificate against the next one; the last one against itself if self-issued, or
+/// against `anchors` (a trust store) by subject name.
+pub fn chain(certs: [Cert], anchors: [Cert]) -> [Link] {
+    var out: [Link] = [];
+    var i = 0;
+    while (i < certs.len()) {
+        let c = certs[i];
+        var issuer: Option<Cert> = Option.None;
+        if (i + 1 < certs.len()) {
+            issuer = Option.Some(certs[i + 1]);
+        } else if (x509.self_issued(c)) {
+            issuer = Option.Some(c);
+        } else {
+            for a in anchors {
+                if (a.subject_raw == c.issuer_raw) {
+                    issuer = Option.Some(a);
+                    break;
+                }
+            }
+        }
+        let link = match (issuer) {
+            Option.Some(iss) => Link {
+                subject: x509.format_name(c.subject),
+                issuer: x509.format_name(iss.subject),
+                check: cert_signed_by(c, iss),
+                name_ok: c.issuer_raw == iss.subject_raw,
+            },
+            Option.None => Link {
+                subject: x509.format_name(c.subject),
+                issuer: x509.format_name(c.issuer),
+                check: Check.Unsupported("issuer not in the chain nor in the trust store"),
+                name_ok: true,
+            },
+        };
+        out.push(link);
+        i = i + 1;
+    }
+    out
+}

@@ -1,0 +1,550 @@
+//! DER (ITU-T X.690) by hand: a strict decoder into `Node`s that keep their raw octets (what a
+//! signature covers), the `Asn1` value tree, and the `DerEncode` trait every X.509 piece implements.
+
+import std/collections/bytesbuilder as bb;
+import std/time;
+
+pub const TAG_BOOLEAN: int = 0x01;
+pub const TAG_INTEGER: int = 0x02;
+pub const TAG_BIT_STRING: int = 0x03;
+pub const TAG_OCTET_STRING: int = 0x04;
+pub const TAG_NULL: int = 0x05;
+pub const TAG_OID: int = 0x06;
+pub const TAG_UTF8: int = 0x0c;
+pub const TAG_PRINTABLE: int = 0x13;
+pub const TAG_T61: int = 0x14;
+pub const TAG_IA5: int = 0x16;
+pub const TAG_UTC_TIME: int = 0x17;
+pub const TAG_GEN_TIME: int = 0x18;
+pub const TAG_BMP: int = 0x1e;
+pub const TAG_SEQUENCE: int = 0x30;
+pub const TAG_SET: int = 0x31;
+
+/// Anything that serializes itself as one DER TLV.
+pub trait DerEncode {
+    fn to_der(self) -> bytes;
+}
+
+/// An ASN.1 value to encode. `Explicit(n, v)` is the constructed context tag `[n]` wrapping
+/// `v`; `Implicit(n, content)` is the primitive context tag `[n]` with raw content;
+/// `ImplicitSeq(n, items)` is a constructed `[n]` replacing a SEQUENCE/SET tag.
+pub enum Asn1 {
+    Bool(bool),
+    Int(bytes),
+    BitStr(bytes),
+    OctStr(bytes),
+    Null,
+    Oid(string),
+    Str(int, string),
+    Time(int),
+    Seq([Asn1]),
+    Set([Asn1]),
+    Explicit(int, Asn1),
+    Implicit(int, bytes),
+    ImplicitSeq(int, [Asn1]),
+    Raw(bytes),
+}
+
+impl DerEncode for Asn1 {
+    fn to_der(self) -> bytes {
+        encode(self)
+    }
+}
+
+/// A decoded TLV: its tag octet, its content and the whole element as it was on the wire.
+pub struct Node {
+    tag: int,
+    body: bytes,
+    raw: bytes,
+}
+
+// ---------------------------------------------------------------- encoding
+
+/// The definite-length header of a TLV.
+pub fn header(tag: int, len: int) -> bytes {
+    if (len < 0x80) {
+        return bytes_of([tag, len]);
+    }
+    var octets: [int] = [];
+    var n = len;
+    while (n > 0) {
+        octets.insert_at(0, n & 0xff);
+        n = n >> 8;
+    }
+    bytes_of([tag, 0x80 | octets.len()] + octets)
+}
+
+pub fn tlv(tag: int, content: bytes) -> bytes {
+    bytes_concat([header(tag, content.len()), content])
+}
+
+fn concat_all<T: DerEncode>(items: [T]) -> bytes {
+    let out = bb.new();
+    for it in items {
+        out.push(it.to_der());
+    }
+    out.build()
+}
+
+/// SEQUENCE OF anything encodable — the generic building block of the X.509 structures.
+pub fn seq_of<T: DerEncode>(items: [T]) -> bytes {
+    tlv(TAG_SEQUENCE, concat_all(items))
+}
+
+/// SET OF, with the elements sorted by their encoding (X.690 §11.6).
+pub fn set_of<T: DerEncode>(items: [T]) -> bytes {
+    var encs: [bytes] = [];
+    for it in items {
+        encs.push(it.to_der());
+    }
+    encs = sort_by(encs, fn(a: bytes, b: bytes) -> bool { bytes_less(a, b) });
+    tlv(TAG_SET, bytes_concat(encs))
+}
+
+fn bytes_less(a: bytes, b: bytes) -> bool {
+    var i = 0;
+    while (i < a.len() && i < b.len()) {
+        if (a[i] != b[i]) {
+            return a[i] < b[i];
+        }
+        i = i + 1;
+    }
+    a.len() < b.len()
+}
+
+pub fn encode(v: Asn1) -> bytes {
+    match (v) {
+        Asn1.Bool(b) => tlv(TAG_BOOLEAN, bytes_of([if (b) { 0xff } else { 0 }])),
+        Asn1.Int(c) => tlv(TAG_INTEGER, c),
+        Asn1.BitStr(c) => tlv(TAG_BIT_STRING, bytes_concat([bytes_of([0]), c])),
+        Asn1.OctStr(c) => tlv(TAG_OCTET_STRING, c),
+        Asn1.Null => bytes_of([TAG_NULL, 0]),
+        Asn1.Oid(s) => tlv(TAG_OID, oid_encode(s)),
+        Asn1.Str(tag, s) => tlv(tag, s.to_bytes()),
+        Asn1.Time(ms) => encode_time(ms),
+        Asn1.Seq(items) => seq_of(items),
+        Asn1.Set(items) => set_of(items),
+        Asn1.Explicit(n, inner) => tlv(0xa0 | n, encode(inner)),
+        Asn1.Implicit(n, c) => tlv(0x80 | n, c),
+        Asn1.ImplicitSeq(n, items) => tlv(0xa0 | n, concat_all(items)),
+        Asn1.Raw(b) => b,
+    }
+}
+
+/// The INTEGER content octets of a non-negative-or-negative `int` (minimal two's complement).
+pub fn int_content(n: int) -> bytes {
+    var octets: [int] = [n & 0xff];
+    var rest = n >> 8;
+    while (!((rest == 0 && (octets[0] & 0x80) == 0) || (rest == -1 && (octets[0] & 0x80) != 0))) {
+        octets.insert_at(0, rest & 0xff);
+        rest = rest >> 8;
+    }
+    bytes_of(octets)
+}
+
+/// The INTEGER content of an unsigned big-endian magnitude (a serial number, an RSA modulus).
+pub fn uint_content(mag: bytes) -> bytes {
+    var i = 0;
+    while (i < mag.len() - 1 && mag[i] == 0) {
+        i = i + 1;
+    }
+    let m = mag.sub_bytes(i, mag.len());
+    if (m.len() == 0) {
+        return bytes_of([0]);
+    }
+    if ((m[0] & 0x80) != 0) {
+        return bytes_concat([bytes_of([0]), m]);
+    }
+    m
+}
+
+pub fn int_of(n: int) -> Asn1 {
+    Asn1.Int(int_content(n))
+}
+
+pub fn uint_of(mag: bytes) -> Asn1 {
+    Asn1.Int(uint_content(mag))
+}
+
+/// Dotted OID text → content octets. Panics never: a bad arc gives an empty encoding, which
+/// the tests catch; OIDs here are constants of the program.
+pub fn oid_encode(s: string) -> bytes {
+    let parts = s.split(".");
+    var arcs: [int] = [];
+    for p in parts {
+        arcs.push(parse_int(p).unwrap_or(0));
+    }
+    if (arcs.len() < 2) {
+        return bytes_of([]);
+    }
+    var octets: [int] = [];
+    var all: [int] = [arcs[0] * 40 + arcs[1]];
+    all = all + arcs.slice(2, arcs.len());
+    for a in all {
+        var chunk: [int] = [a & 0x7f];
+        var rest = a >> 7;
+        while (rest > 0) {
+            chunk.insert_at(0, (rest & 0x7f) | 0x80);
+            rest = rest >> 7;
+        }
+        octets = octets + chunk;
+    }
+    bytes_of(octets)
+}
+
+/// UTCTime for 1950–2049, GeneralizedTime otherwise (RFC 5280 §4.1.2.5).
+pub fn encode_time(ms: int) -> bytes {
+    let dt = time.from_epoch_millis(ms);
+    let rest = "${two(dt.month)}${two(dt.day)}${two(dt.hour)}${two(dt.minute)}${two(dt.second)}Z";
+    if (dt.year >= 1950 && dt.year < 2050) {
+        tlv(TAG_UTC_TIME, "${two(dt.year % 100)}${rest}".to_bytes())
+    } else {
+        tlv(TAG_GEN_TIME, "${dt.year}${rest}".to_bytes())
+    }
+}
+
+fn two(n: int) -> string {
+    if (n < 10) { "0${n}" } else { "${n}" }
+}
+
+// ---------------------------------------------------------------- decoding
+
+/// Reads one TLV at `off`; returns the node and the offset after it. Strict DER: definite
+/// lengths in minimal form, low tag numbers only, no indefinite length.
+pub fn read(b: bytes, off: int) -> Result<(Node, int), string> {
+    if (off + 2 > b.len()) {
+        return Result.Err("truncated DER at offset ${off}");
+    }
+    let tag = b[off];
+    if ((tag & 0x1f) == 0x1f) {
+        return Result.Err("high tag numbers are not supported (offset ${off})");
+    }
+    let first = b[off + 1];
+    var len = 0;
+    var hdr = 2;
+    if (first < 0x80) {
+        len = first;
+    } else if (first == 0x80) {
+        return Result.Err("indefinite length is not DER (offset ${off})");
+    } else {
+        let n = first & 0x7f;
+        if (n > 4) {
+            return Result.Err("length of ${n} octets is too large (offset ${off})");
+        }
+        if (off + 2 + n > b.len()) {
+            return Result.Err("truncated length at offset ${off}");
+        }
+        if (b[off + 2] == 0) {
+            return Result.Err("non-minimal length at offset ${off}");
+        }
+        var i = 0;
+        while (i < n) {
+            len = (len << 8) | b[off + 2 + i];
+            i = i + 1;
+        }
+        if (len < 0x80) {
+            return Result.Err("non-minimal length at offset ${off}");
+        }
+        hdr = 2 + n;
+    }
+    let end = off + hdr + len;
+    if (end > b.len()) {
+        return Result.Err("element at offset ${off} runs past the end (${len} > ${b.len() - off - hdr})");
+    }
+    let node = Node { tag: tag, body: b.sub_bytes(off + hdr, end), raw: b.sub_bytes(off, end) };
+    Result.Ok((node, end))
+}
+
+/// Exactly one TLV filling all of `b`.
+pub fn parse(b: bytes) -> Result<Node, string> {
+    let (n, end) = read(b, 0)?;
+    if (end != b.len()) {
+        return Result.Err("${b.len() - end} trailing octets after the DER element");
+    }
+    Result.Ok(n)
+}
+
+pub fn is_constructed(n: Node) -> bool {
+    (n.tag & 0x20) != 0
+}
+
+/// The elements inside a constructed node.
+pub fn children(n: Node) -> Result<[Node], string> {
+    if (!is_constructed(n)) {
+        return Result.Err("tag 0x${hex2(n.tag)} is not constructed");
+    }
+    var out: [Node] = [];
+    var off = 0;
+    while (off < n.body.len()) {
+        let (c, next) = read(n.body, off)?;
+        out.push(c);
+        off = next;
+    }
+    Result.Ok(out)
+}
+
+/// Children of a node that must carry `tag`.
+pub fn expect(n: Node, tag: int, what: string) -> Result<[Node], string> {
+    if (n.tag != tag) {
+        return Result.Err("${what}: expected tag 0x${hex2(tag)}, found 0x${hex2(n.tag)}");
+    }
+    children(n)
+}
+
+pub fn hex2(n: int) -> string {
+    let digits = "0123456789abcdef";
+    "${digits[(n >> 4) & 15]}${digits[n & 15]}"
+}
+
+pub fn as_oid(n: Node) -> Result<string, string> {
+    if (n.tag != TAG_OID) {
+        return Result.Err("expected an OID, found tag 0x${hex2(n.tag)}");
+    }
+    oid_decode(n.body)
+}
+
+pub fn oid_decode(c: bytes) -> Result<string, string> {
+    if (c.len() == 0) {
+        return Result.Err("empty OID");
+    }
+    var arcs: [string] = [];
+    var acc = 0;
+    var first = true;
+    var i = 0;
+    while (i < c.len()) {
+        let o = c[i];
+        if (acc == 0 && o == 0x80) {
+            return Result.Err("non-minimal OID arc");
+        }
+        if (acc > (1 << 48)) {
+            return Result.Err("OID arc too large");
+        }
+        acc = (acc << 7) | (o & 0x7f);
+        if ((o & 0x80) == 0) {
+            if (first) {
+                let a = if (acc < 40) { 0 } else if (acc < 80) { 1 } else { 2 };
+                arcs.push("${a}");
+                arcs.push("${acc - a * 40}");
+                first = false;
+            } else {
+                arcs.push("${acc}");
+            }
+            acc = 0;
+        }
+        i = i + 1;
+    }
+    if ((c[c.len() - 1] & 0x80) != 0) {
+        return Result.Err("truncated OID");
+    }
+    Result.Ok(arcs.join("."))
+}
+
+/// A small INTEGER (versions, path lengths); Err if it does not fit 62 bits.
+pub fn as_int(n: Node) -> Result<int, string> {
+    if (n.tag != TAG_INTEGER) {
+        return Result.Err("expected an INTEGER, found tag 0x${hex2(n.tag)}");
+    }
+    if (n.body.len() == 0 || n.body.len() > 7) {
+        return Result.Err("INTEGER of ${n.body.len()} octets does not fit an int");
+    }
+    var v = if ((n.body[0] & 0x80) != 0) { -1 } else { 0 };
+    for o in n.body {
+        v = (v << 8) | o;
+    }
+    Result.Ok(v)
+}
+
+/// The unsigned magnitude of an INTEGER (leading zero octets dropped).
+pub fn as_uint(n: Node) -> Result<bytes, string> {
+    if (n.tag != TAG_INTEGER) {
+        return Result.Err("expected an INTEGER, found tag 0x${hex2(n.tag)}");
+    }
+    var i = 0;
+    while (i < n.body.len() - 1 && n.body[i] == 0) {
+        i = i + 1;
+    }
+    Result.Ok(n.body.sub_bytes(i, n.body.len()))
+}
+
+pub fn as_bool(n: Node) -> Result<bool, string> {
+    if (n.tag != TAG_BOOLEAN || n.body.len() != 1) {
+        return Result.Err("expected a BOOLEAN");
+    }
+    Result.Ok(n.body[0] != 0)
+}
+
+/// BIT STRING content without the unused-bits octet (keys and signatures use whole octets).
+pub fn as_bits(n: Node) -> Result<bytes, string> {
+    if (n.tag != TAG_BIT_STRING || n.body.len() == 0) {
+        return Result.Err("expected a BIT STRING");
+    }
+    Result.Ok(n.body.sub_bytes(1, n.body.len()))
+}
+
+/// The bits of a BIT STRING as flags, most significant bit of the first octet first (KeyUsage).
+pub fn bit_flags(n: Node) -> Result<[bool], string> {
+    if (n.tag != TAG_BIT_STRING || n.body.len() == 0) {
+        return Result.Err("expected a BIT STRING");
+    }
+    let unused = n.body[0];
+    var out: [bool] = [];
+    var i = 1;
+    while (i < n.body.len()) {
+        var bit = 7;
+        while (bit >= 0) {
+            out.push((n.body[i] & (1 << bit)) != 0);
+            bit = bit - 1;
+        }
+        i = i + 1;
+    }
+    Result.Ok(out.slice(0, out.len() - unused))
+}
+
+/// Text of the string types found in certificates. BMPString is UTF-16BE.
+pub fn as_text(n: Node) -> Result<string, string> {
+    if (n.tag == TAG_BMP) {
+        var cs: [char] = [];
+        var i = 0;
+        while (i + 1 < n.body.len()) {
+            let code = (n.body[i] << 8) | n.body[i + 1];
+            cs.push(char_from_code(code).unwrap_or('?'));
+            i = i + 2;
+        }
+        return Result.Ok(cs.chars_to_string(0, cs.len()));
+    }
+    if (n.tag == TAG_T61) {
+        // T.61 in practice is Latin-1 in the certificates that still use it.
+        var cs: [char] = [];
+        for o in n.body {
+            cs.push(char_from_code(o).unwrap_or('?'));
+        }
+        return Result.Ok(cs.chars_to_string(0, cs.len()));
+    }
+    from_utf8(n.body)
+}
+
+/// UTCTime / GeneralizedTime → epoch milliseconds (only the `Z` forms RFC 5280 allows).
+pub fn as_time(n: Node) -> Result<int, string> {
+    let s = from_utf8(n.body)?;
+    var year = 0;
+    var rest = "";
+    if (n.tag == TAG_UTC_TIME) {
+        if (s.len() != 13 || !s.ends_with("Z")) {
+            return Result.Err("UTCTime '${s}' is not YYMMDDHHMMSSZ");
+        }
+        let yy = digits(s, 0, 2)?;
+        year = if (yy >= 50) { 1900 + yy } else { 2000 + yy };
+        rest = s.substring(2, 12);
+    } else if (n.tag == TAG_GEN_TIME) {
+        if (s.len() != 15 || !s.ends_with("Z")) {
+            return Result.Err("GeneralizedTime '${s}' is not YYYYMMDDHHMMSSZ");
+        }
+        year = digits(s, 0, 4)?;
+        rest = s.substring(4, 14);
+    } else {
+        return Result.Err("expected a time, found tag 0x${hex2(n.tag)}");
+    }
+    let month = digits(rest, 0, 2)?;
+    let day = digits(rest, 2, 4)?;
+    let hour = digits(rest, 4, 6)?;
+    let minute = digits(rest, 6, 8)?;
+    let second = digits(rest, 8, 10)?;
+    if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) {
+        return Result.Err("time '${s}' out of range");
+    }
+    if (year < 1970) {
+        return Result.Err("time '${s}' before 1970 is not supported");
+    }
+    let dt = time.DateTime {
+        year: year,
+        month: month,
+        day: day,
+        hour: hour,
+        minute: minute,
+        second: second,
+        weekday: 0,
+    };
+    Result.Ok(time.to_epoch_millis(dt))
+}
+
+fn digits(s: string, i: int, j: int) -> Result<int, string> {
+    let part = s.substring(i, j);
+    for c in part.chars() {
+        if (c < '0' || c > '9') {
+            return Result.Err("'${part}' is not a number");
+        }
+    }
+    parse_int(part).ok_or("'${part}' is not a number")
+}
+
+// ---------------------------------------------------------------- tree dump
+
+/// An indented outline of any DER (like `openssl asn1parse`), for `raycert der`.
+pub fn dump(b: bytes) -> Result<string, string> {
+    var lines: [string] = [];
+    dump_into(b, 0, lines)?;
+    Result.Ok(lines.join("\n"))
+}
+
+fn dump_into(b: bytes, depth: int, lines: [string]) -> Result<int, string> {
+    var off = 0;
+    while (off < b.len()) {
+        let (n, next) = read(b, off)?;
+        let pad = "  ".repeat(depth);
+        let name = tag_name(n.tag);
+        if (is_constructed(n)) {
+            lines.push("${pad}${name} (${n.body.len()} octets)");
+            dump_into(n.body, depth + 1, lines)?;
+        } else {
+            lines.push("${pad}${name} ${preview(n)}");
+        }
+        off = next;
+    }
+    Result.Ok(0)
+}
+
+fn preview(n: Node) -> string {
+    if (n.tag == TAG_OID) {
+        return oid_decode(n.body).unwrap_or("<bad oid>");
+    }
+    if (n.tag == TAG_INTEGER) {
+        if (n.body.len() <= 7) {
+            return as_int(n).map(fn(v: int) -> string { "${v}" }).unwrap_or("?");
+        }
+        return "(${n.body.len() * 8} bits)";
+    }
+    if ([TAG_UTF8, TAG_PRINTABLE, TAG_IA5, TAG_UTC_TIME, TAG_GEN_TIME, TAG_T61, TAG_BMP].contains(n.tag)) {
+        return "'${as_text(n).unwrap_or("?")}'";
+    }
+    if (n.tag == TAG_BOOLEAN) {
+        return if (as_bool(n).unwrap_or(false)) { "true" } else { "false" };
+    }
+    "(${n.body.len()} octets)"
+}
+
+pub fn tag_name(tag: int) -> string {
+    match (tag) {
+        0x01 => "BOOLEAN",
+        0x02 => "INTEGER",
+        0x03 => "BIT STRING",
+        0x04 => "OCTET STRING",
+        0x05 => "NULL",
+        0x06 => "OID",
+        0x0c => "UTF8String",
+        0x13 => "PrintableString",
+        0x14 => "T61String",
+        0x16 => "IA5String",
+        0x17 => "UTCTime",
+        0x18 => "GeneralizedTime",
+        0x1e => "BMPString",
+        0x30 => "SEQUENCE",
+        0x31 => "SET",
+        _ => {
+            if ((tag & 0xc0) == 0x80) {
+                "[${tag & 0x1f}]"
+            } else {
+                "tag 0x${hex2(tag)}"
+            }
+        },
+    }
+}

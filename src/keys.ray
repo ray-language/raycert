@@ -1,0 +1,210 @@
+//! Private keys of the three kinds std/crypto can sign with — Ed25519, ECDSA P-256 and RSA —
+//! held as PKCS#8 DER, with their SubjectPublicKeyInfo and X.509/JWS signatures.
+
+import der;
+import oid;
+import x509;
+import std/crypto;
+import std/pem;
+from der import Asn1, DerEncode;
+
+pub enum KeyKind {
+    Ed25519,
+    P256,
+    Rsa(int),
+}
+
+pub struct PrivKey {
+    kind: KeyKind,
+    pkcs8: bytes,
+}
+
+pub fn kind_name(k: KeyKind) -> string {
+    match (k) {
+        KeyKind.Ed25519 => "ed25519",
+        KeyKind.P256 => "p256",
+        KeyKind.Rsa(bits) => "rsa${bits}",
+    }
+}
+
+/// `ed25519`, `p256` / `ec`, `rsa` (2048) or `rsa3072` / `rsa4096`.
+pub fn parse_kind(s: string) -> Result<KeyKind, string> {
+    match (s.to_lower()) {
+        "ed25519" => Result.Ok(KeyKind.Ed25519),
+        "p256" => Result.Ok(KeyKind.P256),
+        "ec" => Result.Ok(KeyKind.P256),
+        "ecdsa" => Result.Ok(KeyKind.P256),
+        "rsa" => Result.Ok(KeyKind.Rsa(2048)),
+        "rsa2048" => Result.Ok(KeyKind.Rsa(2048)),
+        "rsa3072" => Result.Ok(KeyKind.Rsa(3072)),
+        "rsa4096" => Result.Ok(KeyKind.Rsa(4096)),
+        other => Result.Err("unknown key type '${other}' (ed25519, p256, rsa, rsa3072, rsa4096)"),
+    }
+}
+
+pub fn generate(k: KeyKind) -> Result<PrivKey, string> {
+    match (k) {
+        KeyKind.Ed25519 => Result.Ok(PrivKey { kind: k, pkcs8: ed25519_pkcs8(crypto.random_bytes(32)) }),
+        KeyKind.P256 => Result.Ok(PrivKey { kind: k, pkcs8: crypto.p256_generate()? }),
+        KeyKind.Rsa(bits) => Result.Ok(PrivKey { kind: k, pkcs8: crypto.rsa_generate(bits)? }),
+    }
+}
+
+/// std/crypto takes an Ed25519 key as its raw 32-octet seed, not as PKCS#8: we wrap and unwrap
+/// the RFC 8410 envelope ourselves so the files look like `openssl genpkey -algorithm ed25519`.
+pub fn ed25519_pkcs8(seed: bytes) -> bytes {
+    der.encode(Asn1.Seq([
+        der.int_of(0),
+        Asn1.Seq([Asn1.Oid(oid.ED25519)]),
+        Asn1.OctStr(der.encode(Asn1.OctStr(seed))),
+    ]))
+}
+
+/// The algorithm OID (and curve, for EC) inside a PKCS#8 PrivateKeyInfo.
+fn pkcs8_alg(b: bytes) -> Result<(string, string, bytes), string> {
+    let kids = der.expect(der.parse(b)?, der.TAG_SEQUENCE, "PrivateKeyInfo")?;
+    if (kids.len() < 3) {
+        return Result.Err("PrivateKeyInfo with ${kids.len()} elements");
+    }
+    let a = x509.parse_alg(kids[1])?;
+    var curve = "";
+    if let Option.Some(p) = a.params {
+        let pn = der.parse(p)?;
+        if (pn.tag == der.TAG_OID) {
+            curve = der.as_oid(pn)?;
+        }
+    }
+    if (kids[2].tag != der.TAG_OCTET_STRING) {
+        return Result.Err("PrivateKeyInfo without a privateKey OCTET STRING");
+    }
+    Result.Ok((a.oid, curve, kids[2].body))
+}
+
+pub fn from_pkcs8(b: bytes) -> Result<PrivKey, string> {
+    let (alg, curve, _) = pkcs8_alg(b)?;
+    if (alg == oid.ED25519) {
+        return Result.Ok(PrivKey { kind: KeyKind.Ed25519, pkcs8: b });
+    }
+    if (alg == oid.EC_PUBLIC_KEY) {
+        if (curve != oid.P256) {
+            return Result.Err("EC key on ${oid.name(curve)}: std/crypto signs only with P-256");
+        }
+        return Result.Ok(PrivKey { kind: KeyKind.P256, pkcs8: b });
+    }
+    if (alg == oid.RSA_ENCRYPTION) {
+        let pubkey = crypto.rsa_public_key_of(b)?;
+        let (n, _) = crypto.rsa_public_components(pubkey)?;
+        return Result.Ok(PrivKey { kind: KeyKind.Rsa(n.len() * 8), pkcs8: b });
+    }
+    Result.Err("unsupported private key algorithm ${oid.name(alg)}")
+}
+
+/// A `PRIVATE KEY` (PKCS#8) PEM. The legacy `EC PRIVATE KEY` / `RSA PRIVATE KEY` forms are
+/// refused with the openssl command that converts them.
+pub fn from_pem(text: string) -> Result<PrivKey, string> {
+    for b in pem.decode_all(text)? {
+        if (b.label == "PRIVATE KEY") {
+            return from_pkcs8(b.der);
+        }
+        if (b.label == "EC PRIVATE KEY" || b.label == "RSA PRIVATE KEY") {
+            return Result.Err("${b.label} is the legacy form; convert it with `openssl pkcs8 -topk8 -nocrypt`");
+        }
+        if (b.label == "ENCRYPTED PRIVATE KEY") {
+            return Result.Err("encrypted private keys are not supported");
+        }
+    }
+    Result.Err("no PRIVATE KEY block found")
+}
+
+pub fn to_pem(k: PrivKey) -> string {
+    pem.encode("PRIVATE KEY", k.pkcs8)
+}
+
+pub fn ed25519_seed(k: PrivKey) -> Result<bytes, string> {
+    let (_, _, inner) = pkcs8_alg(k.pkcs8)?;
+    let n = der.parse(inner)?;
+    if (n.tag != der.TAG_OCTET_STRING || n.body.len() != 32) {
+        return Result.Err("Ed25519 key without a 32-octet seed");
+    }
+    Result.Ok(n.body)
+}
+
+/// The raw public key: 32 octets (Ed25519), the SEC1 point (P-256), PKCS#1 DER (RSA).
+pub fn public_raw(k: PrivKey) -> Result<bytes, string> {
+    match (k.kind) {
+        KeyKind.Ed25519 => crypto.ed25519_public_key(ed25519_seed(k)?).ok_or("bad Ed25519 seed"),
+        KeyKind.P256 => crypto.p256_public_key(k.pkcs8),
+        KeyKind.Rsa(_) => crypto.rsa_public_key_of(k.pkcs8),
+    }
+}
+
+/// The SubjectPublicKeyInfo of the key, as written into certificates and CSRs.
+pub fn spki_der(k: PrivKey) -> Result<bytes, string> {
+    let raw = public_raw(k)?;
+    let a = match (k.kind) {
+        KeyKind.Ed25519 => x509.alg(oid.ED25519),
+        KeyKind.P256 => x509.AlgId { oid: oid.EC_PUBLIC_KEY, params: Option.Some(der.encode(Asn1.Oid(oid.P256))) },
+        KeyKind.Rsa(_) => x509.alg_null(oid.RSA_ENCRYPTION),
+    };
+    Result.Ok(der.encode(Asn1.Seq([Asn1.Raw(a.to_der()), Asn1.BitStr(raw)])))
+}
+
+/// The signatureAlgorithm a certificate signed by this key carries.
+pub fn sig_alg(k: PrivKey) -> x509.AlgId {
+    match (k.kind) {
+        KeyKind.Ed25519 => x509.alg(oid.ED25519),
+        KeyKind.P256 => x509.alg(oid.ECDSA_SHA256),
+        KeyKind.Rsa(_) => x509.alg_null(oid.SHA256_WITH_RSA),
+    }
+}
+
+/// The signature in the form X.509 and PKCS#10 carry (ECDSA as DER `SEQUENCE { r, s }`).
+pub fn sign_x509(k: PrivKey, msg: bytes) -> Result<bytes, string> {
+    match (k.kind) {
+        KeyKind.Ed25519 => crypto.ed25519_sign(ed25519_seed(k)?, msg).ok_or("Ed25519 signing failed"),
+        KeyKind.P256 => {
+            let rs = crypto.p256_sign(k.pkcs8, msg)?;
+            Result.Ok(ecdsa_der(rs))
+        },
+        KeyKind.Rsa(_) => crypto.rsa_pkcs1_sign(k.pkcs8, msg),
+    }
+}
+
+/// The signature in the form JWS carries (ES256 as fixed `r || s`).
+pub fn sign_jws(k: PrivKey, msg: bytes) -> Result<bytes, string> {
+    match (k.kind) {
+        KeyKind.Ed25519 => crypto.ed25519_sign(ed25519_seed(k)?, msg).ok_or("Ed25519 signing failed"),
+        KeyKind.P256 => crypto.p256_sign(k.pkcs8, msg),
+        KeyKind.Rsa(_) => crypto.rsa_pkcs1_sign(k.pkcs8, msg),
+    }
+}
+
+/// `r || s` (64 octets) → DER `SEQUENCE { INTEGER r, INTEGER s }`.
+pub fn ecdsa_der(rs: bytes) -> bytes {
+    let half = rs.len() / 2;
+    der.encode(Asn1.Seq([der.uint_of(rs.sub_bytes(0, half)), der.uint_of(rs.sub_bytes(half, rs.len()))]))
+}
+
+/// DER `SEQUENCE { r, s }` → fixed `r || s` of `size` octets each.
+pub fn ecdsa_raw(sig: bytes, size: int) -> Result<bytes, string> {
+    let kids = der.expect(der.parse(sig)?, der.TAG_SEQUENCE, "ECDSA-Sig-Value")?;
+    if (kids.len() != 2) {
+        return Result.Err("ECDSA signature with ${kids.len()} elements");
+    }
+    let r = pad(der.as_uint(kids[0])?, size)?;
+    let s = pad(der.as_uint(kids[1])?, size)?;
+    Result.Ok(bytes_concat([r, s]))
+}
+
+fn pad(b: bytes, size: int) -> Result<bytes, string> {
+    if (b.len() > size) {
+        return Result.Err("integer of ${b.len()} octets does not fit ${size}");
+    }
+    var zeros: [int] = [];
+    var i = b.len();
+    while (i < size) {
+        zeros.push(0);
+        i = i + 1;
+    }
+    Result.Ok(bytes_concat([bytes_of(zeros), b]))
+}

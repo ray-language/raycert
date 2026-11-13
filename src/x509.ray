@@ -1,0 +1,531 @@
+//! X.509 v3 certificates (RFC 5280) and the pieces they share with CSRs: parsing from DER into
+//! structs, and encoding those structs back through `der.DerEncode`.
+
+import der;
+import oid;
+import std/crypto;
+import std/hex;
+import std/time;
+from der import Asn1, Node, DerEncode;
+
+/// An AlgorithmIdentifier; `params` is the raw DER of the parameters, if any.
+pub struct AlgId {
+    oid: string,
+    params: Option<bytes>,
+}
+
+/// One AttributeTypeAndValue of a distinguished name. `tag` is the string type it was (or will
+/// be) written with.
+pub struct Attr {
+    oid: string,
+    tag: int,
+    value: string,
+}
+
+/// A distinguished name: RDNs in order, each a set of attributes.
+pub struct Name {
+    rdns: [[Attr]],
+}
+
+/// SubjectPublicKeyInfo. `curve` is the named curve OID for EC keys, "" otherwise; `key` is the
+/// BIT STRING content (PKCS#1 for RSA, the SEC1 point for EC, 32 octets for Ed25519).
+pub struct Spki {
+    alg: string,
+    curve: string,
+    key: bytes,
+    raw: bytes,
+}
+
+pub struct Ext {
+    oid: string,
+    critical: bool,
+    value: bytes,
+}
+
+pub struct Cert {
+    raw: bytes,
+    tbs: bytes,
+    version: int,
+    serial: bytes,
+    tbs_sig: AlgId,
+    issuer: Name,
+    issuer_raw: bytes,
+    not_before: int,
+    not_after: int,
+    subject: Name,
+    subject_raw: bytes,
+    spki: Spki,
+    exts: [Ext],
+    sig_alg: AlgId,
+    signature: bytes,
+}
+
+// ---------------------------------------------------------------- encoding
+
+impl DerEncode for AlgId {
+    fn to_der(self) -> bytes {
+        match (self.params) {
+            Option.Some(p) => der.encode(Asn1.Seq([Asn1.Oid(self.oid), Asn1.Raw(p)])),
+            Option.None => der.encode(Asn1.Seq([Asn1.Oid(self.oid)])),
+        }
+    }
+}
+
+impl DerEncode for Attr {
+    fn to_der(self) -> bytes {
+        der.encode(Asn1.Seq([Asn1.Oid(self.oid), Asn1.Str(self.tag, self.value)]))
+    }
+}
+
+/// The RDN set: a SET OF attributes, through the generic `der.set_of`.
+struct Rdn {
+    attrs: [Attr],
+}
+
+impl DerEncode for Rdn {
+    fn to_der(self) -> bytes {
+        der.set_of(self.attrs)
+    }
+}
+
+impl DerEncode for Name {
+    fn to_der(self) -> bytes {
+        var rdns: [Rdn] = [];
+        for r in self.rdns {
+            rdns.push(Rdn { attrs: r });
+        }
+        der.seq_of(rdns)
+    }
+}
+
+impl DerEncode for Ext {
+    fn to_der(self) -> bytes {
+        var items: [Asn1] = [Asn1.Oid(self.oid)];
+        if (self.critical) {
+            items.push(Asn1.Bool(true));
+        }
+        items.push(Asn1.OctStr(self.value));
+        der.encode(Asn1.Seq(items))
+    }
+}
+
+pub fn alg(o: string) -> AlgId {
+    AlgId { oid: o, params: Option.None }
+}
+
+pub fn alg_null(o: string) -> AlgId {
+    AlgId { oid: o, params: Option.Some(bytes_of([der.TAG_NULL, 0])) }
+}
+
+/// A Name from `CN=example,O=Acme,C=ES` (commas inside values are not supported). Country is a
+/// PrintableString, the rest UTF8String, as RFC 5280 recommends.
+pub fn parse_dn(s: string) -> Result<Name, string> {
+    var rdns: [[Attr]] = [];
+    for part in s.split(",") {
+        let p = part.trim();
+        if (p.len() == 0) {
+            continue;
+        }
+        let eq = p.index_of("=").ok_or("'${p}' is not KEY=value")?;
+        let key = p.substring(0, eq).trim();
+        let value = p.substring(eq + 1, p.len()).trim();
+        let o = oid.attr_of(key).ok_or("unknown attribute '${key}' (use CN, O, OU, L, ST, C)")?;
+        let tag = if (o == oid.COUNTRY) { der.TAG_PRINTABLE } else { der.TAG_UTF8 };
+        rdns.push([Attr { oid: o, tag: tag, value: value }]);
+    }
+    if (rdns.len() == 0) {
+        return Result.Err("empty distinguished name");
+    }
+    Result.Ok(Name { rdns: rdns })
+}
+
+pub fn cn_name(cn: string) -> Name {
+    Name { rdns: [[Attr { oid: oid.CN, tag: der.TAG_UTF8, value: cn }]] }
+}
+
+// ---------------------------------------------------------------- decoding
+
+pub fn parse_alg(n: Node) -> Result<AlgId, string> {
+    let kids = der.expect(n, der.TAG_SEQUENCE, "AlgorithmIdentifier")?;
+    if (kids.len() == 0) {
+        return Result.Err("empty AlgorithmIdentifier");
+    }
+    let o = der.as_oid(kids[0])?;
+    if (kids.len() > 1) {
+        return Result.Ok(AlgId { oid: o, params: Option.Some(kids[1].raw) });
+    }
+    Result.Ok(AlgId { oid: o, params: Option.None })
+}
+
+pub fn parse_name(n: Node) -> Result<Name, string> {
+    var rdns: [[Attr]] = [];
+    for set in der.expect(n, der.TAG_SEQUENCE, "Name")? {
+        var attrs: [Attr] = [];
+        for atv in der.expect(set, der.TAG_SET, "RelativeDistinguishedName")? {
+            let kv = der.expect(atv, der.TAG_SEQUENCE, "AttributeTypeAndValue")?;
+            if (kv.len() != 2) {
+                return Result.Err("AttributeTypeAndValue with ${kv.len()} elements");
+            }
+            let text = der.as_text(kv[1]).unwrap_or("<${kv[1].body.len()} octets>");
+            attrs.push(Attr { oid: der.as_oid(kv[0])?, tag: kv[1].tag, value: text });
+        }
+        rdns.push(attrs);
+    }
+    Result.Ok(Name { rdns: rdns })
+}
+
+pub fn parse_spki(n: Node) -> Result<Spki, string> {
+    let kids = der.expect(n, der.TAG_SEQUENCE, "SubjectPublicKeyInfo")?;
+    if (kids.len() != 2) {
+        return Result.Err("SubjectPublicKeyInfo with ${kids.len()} elements");
+    }
+    let a = parse_alg(kids[0])?;
+    var curve = "";
+    if let Option.Some(p) = a.params {
+        let pn = der.parse(p)?;
+        if (pn.tag == der.TAG_OID) {
+            curve = der.as_oid(pn)?;
+        }
+    }
+    Result.Ok(Spki { alg: a.oid, curve: curve, key: der.as_bits(kids[1])?, raw: n.raw })
+}
+
+pub fn parse_ext(n: Node) -> Result<Ext, string> {
+    let kids = der.expect(n, der.TAG_SEQUENCE, "Extension")?;
+    if (kids.len() < 2 || kids.len() > 3) {
+        return Result.Err("Extension with ${kids.len()} elements");
+    }
+    let o = der.as_oid(kids[0])?;
+    var critical = false;
+    var vi = 1;
+    if (kids.len() == 3) {
+        critical = der.as_bool(kids[1])?;
+        vi = 2;
+    }
+    if (kids[vi].tag != der.TAG_OCTET_STRING) {
+        return Result.Err("extension ${oid.name(o)}: value is not an OCTET STRING");
+    }
+    Result.Ok(Ext { oid: o, critical: critical, value: kids[vi].body })
+}
+
+pub fn parse_exts(n: Node) -> Result<[Ext], string> {
+    var out: [Ext] = [];
+    for e in der.expect(n, der.TAG_SEQUENCE, "Extensions")? {
+        out.push(parse_ext(e)?);
+    }
+    Result.Ok(out)
+}
+
+/// A whole certificate from its DER.
+pub fn parse(b: bytes) -> Result<Cert, string> {
+    let top = der.expect(der.parse(b)?, der.TAG_SEQUENCE, "Certificate")?;
+    if (top.len() != 3) {
+        return Result.Err("Certificate with ${top.len()} elements (expected 3)");
+    }
+    let tbs = der.expect(top[0], der.TAG_SEQUENCE, "TBSCertificate")?;
+    var i = 0;
+    var version = 1;
+    if (tbs.len() > 0 && tbs[0].tag == 0xa0) {
+        let v = der.children(tbs[0])?;
+        if (v.len() != 1) {
+            return Result.Err("bad version field");
+        }
+        version = der.as_int(v[0])? + 1;
+        i = 1;
+    }
+    if (tbs.len() < i + 6) {
+        return Result.Err("TBSCertificate with ${tbs.len()} elements");
+    }
+    let serial = der.as_uint(tbs[i])?;
+    let tbs_sig = parse_alg(tbs[i + 1])?;
+    let issuer = parse_name(tbs[i + 2])?;
+    let validity = der.expect(tbs[i + 3], der.TAG_SEQUENCE, "Validity")?;
+    if (validity.len() != 2) {
+        return Result.Err("Validity with ${validity.len()} elements");
+    }
+    let subject = parse_name(tbs[i + 4])?;
+    let spki = parse_spki(tbs[i + 5])?;
+    var exts: [Ext] = [];
+    var j = i + 6;
+    while (j < tbs.len()) {
+        let t = tbs[j];
+        if (t.tag == 0xa3) {
+            let inner = der.children(t)?;
+            if (inner.len() != 1) {
+                return Result.Err("bad extensions wrapper");
+            }
+            exts = parse_exts(inner[0])?;
+        } else if (t.tag != 0x81 && t.tag != 0x82) {
+            return Result.Err("unexpected element 0x${der.hex2(t.tag)} in TBSCertificate");
+        }
+        j = j + 1;
+    }
+    Result.Ok(Cert {
+        raw: b,
+        tbs: top[0].raw,
+        version: version,
+        serial: serial,
+        tbs_sig: tbs_sig,
+        issuer: issuer,
+        issuer_raw: tbs[i + 2].raw,
+        not_before: der.as_time(validity[0])?,
+        not_after: der.as_time(validity[1])?,
+        subject: subject,
+        subject_raw: tbs[i + 4].raw,
+        spki: spki,
+        exts: exts,
+        sig_alg: parse_alg(top[1])?,
+        signature: der.as_bits(top[2])?,
+    })
+}
+
+// ---------------------------------------------------------------- extensions
+
+pub fn find_ext(c: Cert, o: string) -> Option<Ext> {
+    for e in c.exts {
+        if (e.oid == o) {
+            return Option.Some(e);
+        }
+    }
+    Option.None
+}
+
+/// GeneralNames → `DNS:x`, `IP:1.2.3.4`, `email:x`, `URI:x`.
+pub fn general_names(b: bytes) -> Result<[string], string> {
+    var out: [string] = [];
+    for g in der.expect(der.parse(b)?, der.TAG_SEQUENCE, "GeneralNames")? {
+        let kind = g.tag & 0x1f;
+        if ((g.tag & 0xc0) != 0x80) {
+            out.push("?");
+        } else if (kind == 2) {
+            out.push("DNS:${from_utf8(g.body)?}");
+        } else if (kind == 1) {
+            out.push("email:${from_utf8(g.body)?}");
+        } else if (kind == 6) {
+            out.push("URI:${from_utf8(g.body)?}");
+        } else if (kind == 7) {
+            out.push("IP:${ip_text(g.body)}");
+        } else if (kind == 4) {
+            let inner = der.children(g)?;
+            out.push("DirName:${format_name(parse_name(inner[0])?)}");
+        } else {
+            out.push("other[${kind}]");
+        }
+    }
+    Result.Ok(out)
+}
+
+pub fn ip_text(b: bytes) -> string {
+    if (b.len() == 4) {
+        return "${b[0]}.${b[1]}.${b[2]}.${b[3]}";
+    }
+    var groups: [string] = [];
+    var i = 0;
+    while (i + 1 < b.len()) {
+        let v = (b[i] << 8) | b[i + 1];
+        groups.push(hex_short(v));
+        i = i + 2;
+    }
+    groups.join(":")
+}
+
+fn hex_short(v: int) -> string {
+    let digits = "0123456789abcdef";
+    if (v == 0) {
+        return "0";
+    }
+    var out = "";
+    var n = v;
+    while (n > 0) {
+        out = "${digits[n & 15]}${out}";
+        n = n >> 4;
+    }
+    out
+}
+
+pub fn sans(c: Cert) -> Result<[string], string> {
+    match (find_ext(c, oid.SUBJECT_ALT_NAME)) {
+        Option.Some(e) => general_names(e.value),
+        Option.None => Result.Ok([]),
+    }
+}
+
+/// (is CA, path length or -1).
+pub fn basic_constraints(c: Cert) -> Result<Option<(bool, int)>, string> {
+    match (find_ext(c, oid.BASIC_CONSTRAINTS)) {
+        Option.None => Result.Ok(Option.None),
+        Option.Some(e) => {
+            let kids = der.expect(der.parse(e.value)?, der.TAG_SEQUENCE, "BasicConstraints")?;
+            var ca = false;
+            var path = -1;
+            for k in kids {
+                if (k.tag == der.TAG_BOOLEAN) {
+                    ca = der.as_bool(k)?;
+                } else if (k.tag == der.TAG_INTEGER) {
+                    path = der.as_int(k)?;
+                }
+            }
+            Result.Ok(Option.Some((ca, path)))
+        },
+    }
+}
+
+const KEY_USAGE_NAMES: [string] = [
+    "digitalSignature",
+    "nonRepudiation",
+    "keyEncipherment",
+    "dataEncipherment",
+    "keyAgreement",
+    "keyCertSign",
+    "cRLSign",
+    "encipherOnly",
+    "decipherOnly",
+];
+
+pub fn key_usage(c: Cert) -> Result<[string], string> {
+    match (find_ext(c, oid.KEY_USAGE)) {
+        Option.None => Result.Ok([]),
+        Option.Some(e) => {
+            let flags = der.bit_flags(der.parse(e.value)?)?;
+            var out: [string] = [];
+            var i = 0;
+            while (i < flags.len() && i < KEY_USAGE_NAMES.len()) {
+                if (flags[i]) {
+                    out.push(KEY_USAGE_NAMES[i]);
+                }
+                i = i + 1;
+            }
+            Result.Ok(out)
+        },
+    }
+}
+
+pub fn ext_key_usage(c: Cert) -> Result<[string], string> {
+    match (find_ext(c, oid.EXT_KEY_USAGE)) {
+        Option.None => Result.Ok([]),
+        Option.Some(e) => {
+            var out: [string] = [];
+            for k in der.expect(der.parse(e.value)?, der.TAG_SEQUENCE, "ExtKeyUsage")? {
+                out.push(oid.name(der.as_oid(k)?));
+            }
+            Result.Ok(out)
+        },
+    }
+}
+
+pub fn subject_key_id(c: Cert) -> Option<bytes> {
+    match (find_ext(c, oid.SUBJECT_KEY_ID)) {
+        Option.None => Option.None,
+        Option.Some(e) => der.parse(e.value).ok().map(fn(n: Node) -> bytes { n.body }),
+    }
+}
+
+pub fn authority_key_id(c: Cert) -> Option<bytes> {
+    match (find_ext(c, oid.AUTHORITY_KEY_ID)) {
+        Option.None => Option.None,
+        Option.Some(e) => {
+            let kids = der.parse(e.value).and_then(fn(n: Node) -> Result<[Node], string> { der.children(n) });
+            match (kids) {
+                Result.Ok(ks) => {
+                    for k in ks {
+                        if (k.tag == 0x80) {
+                            return Option.Some(k.body);
+                        }
+                    }
+                    Option.None
+                },
+                Result.Err(_) => Option.None,
+            }
+        },
+    }
+}
+
+// ---------------------------------------------------------------- presentation
+
+pub fn format_name(n: Name) -> string {
+    var parts: [string] = [];
+    for r in n.rdns {
+        for a in r {
+            parts.push("${oid.name(a.oid)}=${a.value}");
+        }
+    }
+    parts.join(", ")
+}
+
+/// The CN of a name, or "" when it has none.
+pub fn common_name(n: Name) -> string {
+    for r in n.rdns {
+        for a in r {
+            if (a.oid == oid.CN) {
+                return a.value;
+            }
+        }
+    }
+    ""
+}
+
+/// `AB:CD:…` — the colon-hex form `openssl x509 -fingerprint` prints.
+pub fn colon_hex(b: bytes) -> string {
+    var parts: [string] = [];
+    for o in b {
+        parts.push(der.hex2(o).to_upper());
+    }
+    parts.join(":")
+}
+
+pub fn fingerprint_sha256(c: Cert) -> string {
+    colon_hex(crypto.sha256(c.raw))
+}
+
+pub fn fingerprint_sha1(c: Cert) -> string {
+    colon_hex(crypto.sha1(c.raw))
+}
+
+/// "RSA 2048", "EC P-256", "Ed25519"…
+pub fn key_description(s: Spki) -> string {
+    if (s.alg == oid.RSA_ENCRYPTION) {
+        match (crypto.rsa_public_components(s.key)) {
+            Result.Ok(ne) => {
+                let (n, _) = ne;
+                var bits = n.len() * 8;
+                if (n.len() > 0) {
+                    var top = n[0];
+                    var lead = 0;
+                    while (lead < 8 && (top & 0x80) == 0) {
+                        top = top << 1;
+                        lead = lead + 1;
+                    }
+                    bits = bits - lead;
+                }
+                return "RSA ${bits}";
+            },
+            Result.Err(_) => return "RSA (unreadable key)",
+        }
+    }
+    if (s.alg == oid.EC_PUBLIC_KEY) {
+        return "EC ${oid.name(s.curve)}";
+    }
+    oid.name(s.alg)
+}
+
+pub fn same_name(a: Cert, b: Cert) -> bool {
+    a.issuer_raw == b.subject_raw
+}
+
+pub fn self_issued(c: Cert) -> bool {
+    c.issuer_raw == c.subject_raw
+}
+
+pub fn days_left(c: Cert, now: int) -> int {
+    let ms = c.not_after - now;
+    if (ms < 0) { -((-ms + 86399999) / 86400000) } else { ms / 86400000 }
+}
+
+pub fn date_text(ms: int) -> string {
+    let dt = time.from_epoch_millis(ms);
+    time.to_iso8601(dt)
+}
+
+pub fn hex_of(b: bytes) -> string {
+    hex.hex_encode(b)
+}
