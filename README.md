@@ -130,8 +130,8 @@ al verificar una cadena (hoy solo firmas y nombres de emisor); y leer la cadena 
 
 ## Hallazgos de dogfood
 
-Borradores para `ray-apps/findings/` (campaña `raycert-1.27.95`), con su reproducción mínima en
-raylang 1.27.95 release. Los rodeos están marcados en el código.
+Registrados en `ray-apps/findings/` (campaña `raycert-1.27.95`) como #379–#383, en este mismo
+orden, con su reproducción mínima en raylang 1.27.95 release. Los rodeos están marcados en el código.
 
 1. **[E] `net.tls_peer_cert` no da el DER ni la cadena.** `PeerCert` trae sujeto, emisor, fechas y
    SANs de la hoja; no hay forma de sacar la huella, el tipo de clave, la firma, las extensiones ni
