@@ -2,7 +2,7 @@
 name = "raycert"
 version = "0.1.0"
 license = "Apache-2.0"
-raylang = "1.27.95"
+raylang = "1.27.111"
 
 [dependencies]
 net = "^0.15.0"

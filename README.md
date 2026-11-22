@@ -31,20 +31,20 @@ Chain:
 
 ```
 $ raycert inspect letsencrypt.org:443
-letsencrypt.org:443 presented 4 certificate(s) (TLS 1.2 handshake, read by hand)
+letsencrypt.org:443 presented 4 certificate(s)
 …
 Chain:
-  #1 signed by #2: not checked (ecdsa-with-SHA384 on P-384: std/crypto has no verifier for it)
-  #2 signed by #3: not checked (ecdsa-with-SHA384 on P-384: std/crypto has no verifier for it)
-  #3 signed by #4: not checked (ecdsa-with-SHA384 on P-384: std/crypto has no verifier for it)
+  #1 signed by #2: valid
+  #2 signed by #3: valid
+  #3 signed by #4: valid
   #4 signed by C=US, O=Internet Security Research Group, CN=ISRG Root X1: valid
 ```
 
 Es una app de *dogfooding*: ejercita lo que las demás apps apenas tocan — **`std/pem`** (ninguna lo
-usaba), **`std/crypto`** con firmas Ed25519/P-256/RSA, **`std/bigint`**-adyacente (enteros DER sin
+usaba), **`std/crypto`** con firmas Ed25519/P-256/RSA y verificación P-384 y SHA-384/512, **`std/bigint`**-adyacente (enteros DER sin
 signo), **`std/base64`** (base64url de JWS), `std/json`, trabajo de bits sobre `bytes` y
 **`BytesBuilder`**, `std/time` (UTCTime/GeneralizedTime), cliente `net/http` y servidor
-`net/webserver` (http-01), **`std/keychain`**, **`std/qr`**, `std/fs` con permisos privados, y un
+`net/webserver` (http-01), **`std/keychain`**, **`std/qr`**, `std/fs` con permisos privados, `net.tls_peer_chain`, y un
 **trait propio con genéricos** (`DerEncode` + `seq_of<T: DerEncode>` + `sign_envelope<T>`) — y
 anota lo que falta (ver [Hallazgos](#hallazgos-de-dogfood)).
 
@@ -87,15 +87,14 @@ raylang **añade** esa raíz a las del sistema y mantiene la verificación.
 |---|---|
 | `der.ray` | DER a mano: decodificador **estricto** (longitudes mínimas, sin longitud indefinida, nada sobrante) a `Node { tag, body, raw }` — `raw` son los octetos exactos que cubre una firma —; el árbol `Asn1` para codificar; el **trait `DerEncode`** y los genéricos `seq_of<T: DerEncode>` / `set_of<T>` (SET OF ordenado por codificación); INTEGER en complemento a dos mínimo, OID base-128, UTCTime/GeneralizedTime según el año |
 | `x509.ray` | `Cert`, `Name`, `Spki`, `AlgId`, `Ext` leídos del DER; `impl DerEncode` para `Name`, `Attr`, `AlgId`, `Ext`; SANs (DNS, IP v4/v6, email, URI), BasicConstraints, KeyUsage, ExtKeyUsage, SKI/AKI, huellas |
-| `keys.ray` | Ed25519, P-256 y RSA como PKCS#8 (`std/crypto` da P-256 y RSA en PKCS#8 pero Ed25519 como semilla: el sobre RFC 8410 se pone y se quita aquí); SubjectPublicKeyInfo; firmas en forma X.509 (ECDSA en DER) y JWS (`r‖s`) |
+| `keys.ray` | Ed25519, P-256 y RSA como PKCS#8, tal cual los dan y los aceptan `std/crypto` y `openssl genpkey`; SubjectPublicKeyInfo; firmas en forma X.509 (ECDSA en DER) y JWS (`r‖s`) |
 | `issue.ray` | `Tbs` (TBSCertificate) y `RequestInfo` (PKCS#10) con `impl DerEncode`, firmados por **un solo genérico** `sign_envelope<T: DerEncode>`; CA autofirmada, hoja con SAN/EKU/AKI, CSR y su lectura |
-| `verify.ray` | firma de un certificado contra la clave del emisor (sha256WithRSA, ecdsa-with-SHA256 en P-256, Ed25519) y la cadena eslabón a eslabón; lo demás se marca «not checked» con el motivo |
-| `tlsprobe.ray` | la cadena del servidor con un **ClientHello TLS 1.2 hecho a mano**: lee registros hasta el mensaje Certificate (en claro en TLS 1.2) y corta; un `Reader` puro, probado con vuelos enlatados partidos en trozos |
+| `verify.ray` | firma de un certificado contra la clave del emisor (sha256/384/512WithRSA, ecdsa-with-SHA256/SHA384 en P-256 y P-384, Ed25519) y la cadena eslabón a eslabón; lo demás (RSA-PSS, P-521, SHA-1…) se marca «not checked» con el motivo |
 | `jws.ray` | JWK (ES256/RS256/EdDSA) con solo los miembros obligatorios en orden, huella RFC 7638, cabecera protegida con `jwk` o `kid`, JWS aplanado, autorización de clave |
 | `acme.ray` | directorio, nonces (`Replay-Nonce`, reintento con `badNonce`), cuenta, pedido, autorizaciones, retos, finalización, descarga; errores RFC 7807 legibles |
 | `obtain.ray` | el flujo entero; el respondedor http-01 es `net/webserver` sobre un listener propio en una fibra, que se para cerrando un canal |
-| `store.ray` | el almacén: directorios 0700, claves 0600 (o en `std/keychain`), escritura atómica, `meta.json` |
-| `ops.ray`, `report.ray`, `cli.ray`, `main.ray` | las operaciones sin E/S de consola (las usan los tests), la presentación y la CLI |
+| `store.ray` | el almacén: directorios creados 0700 (`fs.mkdir_mode`), claves que nacen 0600 (`fs.write_file_mode`) o en `std/keychain`, escritura atómica, `meta.json` |
+| `ops.ray`, `report.ray`, `cli.ray`, `main.ray` | las operaciones sin E/S de consola (las usan los tests; la cadena de un servidor sale de `net.tls_peer_chain`, TLS 1.2 o 1.3, sin verificar en el handshake para poder leer también cadenas autofirmadas o caducadas), la presentación y la CLI |
 
 ## Interoperabilidad
 
@@ -103,11 +102,11 @@ raylang **añade** esa raíz a las del sistema y mantiene la verificación.
 
 | Prueba | Resultado |
 |---|---|
-| `make interop` — `openssl verify` de CA y hojas con CA Ed25519, P-256 y RSA y hojas P-256/RSA; `openssl pkey` de cada clave; `openssl req -verify` de cada CSR; huellas y SANs iguales a los de `openssl x509`; certificados, DER y CSRs de openssl leídos y firmados por raycert; permisos 0600/0700 | **52/52** |
-| TLS real: `openssl s_server` con la cadena de raycert, verificada por `s_client -verify_return_error -verify_hostname` en TLS 1.2 y 1.3; `raycert inspect 127.0.0.1:PORT` lee la hoja servida | ✓ |
+| `make interop` — `openssl verify` de CA y hojas con CA Ed25519, P-256 y RSA y hojas P-256/RSA; `openssl pkey` de cada clave; `openssl req -verify` de cada CSR; huellas y SANs iguales a los de `openssl x509`; certificados, DER y CSRs de openssl leídos y firmados por raycert; una cadena de openssl con raíz P-384 (ecdsa-with-SHA384), intermedio RSA y hojas sha384/sha512WithRSA verificada entera; permisos 0600/0700 | **57/57** |
+| TLS real: `openssl s_server` con la cadena de raycert, verificada por `s_client -verify_return_error -verify_hostname` en TLS 1.2 y 1.3; `raycert inspect 127.0.0.1:PORT` lee la hoja servida, también de un servidor **solo TLS 1.3** | ✓ |
 | TLS real con el **servidor TLS de raylang** (`net/webserver` + rustls, `scripts/tls_server.ray`) cargando las cadenas de raycert con CA Ed25519, P-256 y RSA: GET HTTPS verificado por openssl | ✓ (los tres) |
-| `make pebble` — Pebble 2.6.0 (**binario local** compilado con Go; el demonio de Docker no estaba en marcha): cuenta, pedido, http-01, finalización con CSR P-256 y RSA, descarga; `openssl verify` hasta la raíz de Pebble; `renew --force` con gancho; `renew --within 30` conserva los de 90 días | **9/9** |
-| `inspect` de github.com, letsencrypt.org, www.google.com, example.com | cadenas completas leídas (14 eslabones); 6 verificados, 8 sin verificador en `std/crypto` (ver hallazgo 2) |
+| `make pebble` — Pebble 2.6.0 (**binario local** compilado con Go; el demonio de Docker no estaba en marcha): cuenta, pedido, http-01, finalización con CSR P-256 y RSA, descarga; `openssl verify` hasta la raíz de Pebble; `renew --force` con gancho; `renew --within 30` conserva los de 90 días | **9/9** con raylang 1.27.95; no repetido con 1.27.111 (no había binario de Pebble) |
+| `inspect` de github.com, letsencrypt.org, www.google.com, example.com | cadenas completas leídas, hoja con la misma huella que `openssl s_client`; **14 de 14 eslabones verificados** (antes 6: los 8 de P-384 no tenían verificador) |
 
 Con `PEBBLE_DOCKER=1`, `scripts/pebble.sh` lanza `docker run --rm ghcr.io/letsencrypt/pebble` en
 primer plano de una subshell en segundo plano y la para por su PID; ese camino **no se ha probado**
@@ -117,21 +116,24 @@ primer plano de una subshell en segundo plano y la para por su PID; ese camino *
 
 | Qué | Estado |
 |---|---|
-| DER, X.509, claves, JWS, emisión, almacén, sonda TLS, ACME, CLI | **42 tests** en VM y nativo (`make test`, `make test-native`), raylang 1.27.95 |
+| DER, X.509, claves, JWS, emisión, almacén, ACME, CLI | **39 tests** en VM y nativo (`make test`, `make test-native`), raylang 1.27.111 |
 | ACME sin red | un servidor ACME **guionizado** dentro del test (estado en un actor, comprueba cada JWS — firma, nonce, url, jwk/kid —, valida http-01 pidiéndolo al respondedor, firma el CSR) recorre el cliente entero, también en nativo |
 | Llavero | `make test-keychain`: CA con la clave en el llavero (servicio `raycert-test-<aleatorio>`, borrado al final), VM y nativo |
 | Binario nativo | `make build`: 3,8 MB, `--release` |
-| openssl / Pebble | `make interop` 52/52, `make pebble` 9/9 |
+| openssl / Pebble | `make interop` 57/57 (1.27.111), `make pebble` 9/9 (1.27.95) |
 
 Pendiente: reto `tls-alpn-01` y `dns-01`; revocación (`revokeCert`) y CRL/OCSP; claves de CA
 intermedias (la CA de desarrollo es de un nivel); comprobar nombres de host y restricciones de nombre
-al verificar una cadena (hoy solo firmas y nombres de emisor); y leer la cadena de un servidor
-**solo TLS 1.3**, que necesita lo que pide el hallazgo 1.
+al verificar una cadena (hoy solo firmas y nombres de emisor); y firmas RSA-PSS en certificados
+(`rsa_pss_verify_with` existe, falta leer los parámetros RSASSA-PSS).
 
 ## Hallazgos de dogfood
 
 Registrados en `ray-apps/findings/` (campaña `raycert-1.27.95`) como #379–#383, en este mismo
-orden, con su reproducción mínima en raylang 1.27.95 release. Los rodeos están marcados en el código.
+orden, con su reproducción mínima en raylang 1.27.95 release. **Los cinco se cerraron con la 1.27.108**
+y con raylang 1.27.111 se quitaron los rodeos: la sonda TLS 1.2 hecha a mano (`tlsprobe.ray` y sus
+tests), el sobre RFC 8410 de Ed25519, el «crear vacío + chmod» y el «not checked» de P-384/SHA-384.
+Al re-medir salieron dos de documentación, #461 y #462, cerrados también en 1.27.111.
 
 1. **[E] `net.tls_peer_cert` no da el DER ni la cadena.** `PeerCert` trae sujeto, emisor, fechas y
    SANs de la hoja; no hay forma de sacar la huella, el tipo de clave, la firma, las extensiones ni

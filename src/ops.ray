@@ -4,9 +4,9 @@ import issue;
 import keys;
 import obtain;
 import store;
-import tlsprobe;
 import x509;
 import std/fs;
+import std/net;
 import std/pem;
 import std/process;
 from keys import KeyKind, PrivKey;
@@ -57,13 +57,31 @@ pub fn split_host_port(s: string) -> Option<(string, int)> {
     Option.Some((h, port))
 }
 
+/// The chain a TLS server presents (TLS 1.2 or 1.3), leaf first. The handshake does NOT verify
+/// the certificate: `inspect` must also read self-signed, expired or private-CA chains, and the
+/// links are checked afterwards by `verify.chain`.
 pub fn remote_chain(host: string, port: int) -> Result<[Cert], string> {
+    let tcp = net.tcp_connect_timeout(host, port, REMOTE_TIMEOUT_MS)?;
+    net.set_read_timeout(tcp, REMOTE_TIMEOUT_MS);
+    let ders = match (net.tls_upgrade_insecure(tcp, host)) {
+        Result.Ok(tls) => {
+            let chain = net.tls_peer_chain(tls);
+            close(tls);
+            chain
+        },
+        Result.Err(e) => {
+            close(tcp);
+            Result.Err(e)
+        },
+    }?;
     var out: [Cert] = [];
-    for d in tlsprobe.fetch_chain(host, port, 8000)? {
+    for d in ders {
         out.push(x509.parse(d)?);
     }
     Result.Ok(out)
 }
+
+const REMOTE_TIMEOUT_MS: int = 8000;
 
 /// The system trust store, when there is one at a known place (used as chain anchors).
 pub fn system_anchors() -> [Cert] {

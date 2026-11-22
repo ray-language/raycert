@@ -1,5 +1,6 @@
 //! Signature checks: a certificate (or CSR) signature against a SubjectPublicKeyInfo, and a
-//! whole chain link by link, limited to what std/crypto can verify.
+//! whole chain link by link: RSA PKCS#1 v1.5 (SHA-256/384/512), ECDSA P-256/P-384 (SHA-256/384)
+//! and Ed25519 — what std/crypto can verify.
 
 import oid;
 import x509;
@@ -29,22 +30,31 @@ pub fn is_valid(c: Check) -> bool {
 
 /// Does `sig` over `msg`, made with algorithm `alg`, verify under `key`?
 pub fn signature(alg: string, key: Spki, msg: bytes, sig: bytes) -> Check {
-    if (alg == oid.SHA256_WITH_RSA) {
+    let rsa_hash = rsa_pkcs1_hash(alg);
+    if (rsa_hash != "") {
         if (key.alg != oid.RSA_ENCRYPTION) {
             return Check.Invalid("RSA signature, ${oid.name(key.alg)} key");
         }
-        return verdict(crypto.rsa_pkcs1_verify(key.key, msg, sig), "RSA PKCS#1 v1.5");
+        return verdict(
+            crypto.rsa_pkcs1_verify_with(rsa_hash, key.key, msg, sig),
+            "RSA PKCS#1 v1.5 ${rsa_hash}"
+        );
     }
-    if (alg == oid.ECDSA_SHA256) {
+    let ec_hash = ecdsa_hash(alg);
+    if (ec_hash != "") {
         if (key.alg != oid.EC_PUBLIC_KEY) {
             return Check.Invalid("ECDSA signature, ${oid.name(key.alg)} key");
         }
-        if (key.curve != oid.P256) {
+        let curve = ecdsa_curve(key.curve);
+        if (curve == "") {
             return Check.Unsupported(
-                "ecdsa-with-SHA256 on ${oid.name(key.curve)}: std/crypto verifies only P-256"
+                "${oid.name(alg)} on ${oid.name(key.curve)}: std/crypto verifies P-256 and P-384"
             );
         }
-        return verdict(crypto.p256_verify_asn1(key.key, msg, sig), "ECDSA P-256");
+        return verdict(
+            crypto.ecdsa_verify_asn1(curve, ec_hash, key.key, msg, sig),
+            "ECDSA ${curve} ${ec_hash}"
+        );
     }
     if (alg == oid.ED25519) {
         if (key.alg != oid.ED25519) {
@@ -54,6 +64,42 @@ pub fn signature(alg: string, key: Spki, msg: bytes, sig: bytes) -> Check {
     }
     let why = "${oid.name(alg)}${if (key.curve != "") { " on " + oid.name(key.curve) } else { "" }}: std/crypto has no verifier for it";
     Check.Unsupported(why)
+}
+
+/// The std/crypto hash name of an RSA PKCS#1 v1.5 signature algorithm, `""` if it is not one.
+fn rsa_pkcs1_hash(alg: string) -> string {
+    if (alg == oid.SHA256_WITH_RSA) {
+        return "sha256";
+    }
+    if (alg == oid.SHA384_WITH_RSA) {
+        return "sha384";
+    }
+    if (alg == oid.SHA512_WITH_RSA) {
+        return "sha512";
+    }
+    ""
+}
+
+/// The hash of an ECDSA signature algorithm std/crypto verifies, `""` otherwise.
+fn ecdsa_hash(alg: string) -> string {
+    if (alg == oid.ECDSA_SHA256) {
+        return "sha256";
+    }
+    if (alg == oid.ECDSA_SHA384) {
+        return "sha384";
+    }
+    ""
+}
+
+/// The std/crypto name of a named curve, `""` if it cannot verify on it.
+fn ecdsa_curve(curve: string) -> string {
+    if (curve == oid.P256) {
+        return "p256";
+    }
+    if (curve == oid.P384) {
+        return "p384";
+    }
+    ""
 }
 
 fn verdict(ok: bool, what: string) -> Check {
