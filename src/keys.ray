@@ -44,28 +44,14 @@ pub fn parse_kind(s: string) -> Result<KeyKind, string> {
 
 pub fn generate(k: KeyKind) -> Result<PrivKey, string> {
     match (k) {
-        KeyKind.Ed25519 => Result.Ok(PrivKey { kind: k, pkcs8: ed25519_pkcs8(crypto.random_bytes(32)) }),
+        KeyKind.Ed25519 => Result.Ok(PrivKey { kind: k, pkcs8: crypto.ed25519_generate()? }),
         KeyKind.P256 => Result.Ok(PrivKey { kind: k, pkcs8: crypto.p256_generate()? }),
         KeyKind.Rsa(bits) => Result.Ok(PrivKey { kind: k, pkcs8: crypto.rsa_generate(bits)? }),
     }
 }
 
-/// std/crypto takes an Ed25519 key as its raw 32-octet seed, not as PKCS#8: we wrap and unwrap
-/// the RFC 8410 envelope ourselves so the files look like `openssl genpkey -algorithm ed25519`.
-pub fn ed25519_pkcs8(seed: bytes) -> bytes {
-    der.encode(
-        Asn1.Seq(
-            [
-                der.int_of(0),
-                Asn1.Seq([Asn1.Oid(oid.ED25519)]),
-                Asn1.OctStr(der.encode(Asn1.OctStr(seed)))
-            ]
-        )
-    )
-}
-
 /// The algorithm OID (and curve, for EC) inside a PKCS#8 PrivateKeyInfo.
-fn pkcs8_alg(b: bytes) -> Result<(string, string, bytes), string> {
+fn pkcs8_alg(b: bytes) -> Result<(string, string), string> {
     let kids = der.expect(der.parse(b)?, der.TAG_SEQUENCE, "PrivateKeyInfo")?;
     if (kids.len() < 3) {
         return Result.Err("PrivateKeyInfo with ${kids.len()} elements");
@@ -81,11 +67,11 @@ fn pkcs8_alg(b: bytes) -> Result<(string, string, bytes), string> {
     if (kids[2].tag != der.TAG_OCTET_STRING) {
         return Result.Err("PrivateKeyInfo without a privateKey OCTET STRING");
     }
-    Result.Ok((a.oid, curve, kids[2].body))
+    Result.Ok((a.oid, curve))
 }
 
 pub fn from_pkcs8(b: bytes) -> Result<PrivKey, string> {
-    let (alg, curve, _) = pkcs8_alg(b)?;
+    let (alg, curve) = pkcs8_alg(b)?;
     if (alg == oid.ED25519) {
         return Result.Ok(PrivKey { kind: KeyKind.Ed25519, pkcs8: b });
     }
@@ -126,19 +112,10 @@ pub fn to_pem(k: PrivKey) -> string {
     pem.encode("PRIVATE KEY", k.pkcs8)
 }
 
-pub fn ed25519_seed(k: PrivKey) -> Result<bytes, string> {
-    let (_, _, inner) = pkcs8_alg(k.pkcs8)?;
-    let n = der.parse(inner)?;
-    if (n.tag != der.TAG_OCTET_STRING || n.body.len() != 32) {
-        return Result.Err("Ed25519 key without a 32-octet seed");
-    }
-    Result.Ok(n.body)
-}
-
 /// The raw public key: 32 octets (Ed25519), the SEC1 point (P-256), PKCS#1 DER (RSA).
 pub fn public_raw(k: PrivKey) -> Result<bytes, string> {
     match (k.kind) {
-        KeyKind.Ed25519 => crypto.ed25519_public_key(ed25519_seed(k)?).ok_or("bad Ed25519 seed"),
+        KeyKind.Ed25519 => crypto.ed25519_public_key(k.pkcs8).ok_or("bad Ed25519 PKCS#8"),
         KeyKind.P256 => crypto.p256_public_key(k.pkcs8),
         KeyKind.Rsa(_) => crypto.rsa_public_key_of(k.pkcs8),
     }
@@ -167,7 +144,7 @@ pub fn sig_alg(k: PrivKey) -> x509.AlgId {
 /// The signature in the form X.509 and PKCS#10 carry (ECDSA as DER `SEQUENCE { r, s }`).
 pub fn sign_x509(k: PrivKey, msg: bytes) -> Result<bytes, string> {
     match (k.kind) {
-        KeyKind.Ed25519 => crypto.ed25519_sign(ed25519_seed(k)?, msg).ok_or("Ed25519 signing failed"),
+        KeyKind.Ed25519 => crypto.ed25519_sign(k.pkcs8, msg).ok_or("Ed25519 signing failed"),
         KeyKind.P256 => {
             let rs = crypto.p256_sign(k.pkcs8, msg)?;
             Result.Ok(ecdsa_der(rs))
@@ -179,7 +156,7 @@ pub fn sign_x509(k: PrivKey, msg: bytes) -> Result<bytes, string> {
 /// The signature in the form JWS carries (ES256 as fixed `r || s`).
 pub fn sign_jws(k: PrivKey, msg: bytes) -> Result<bytes, string> {
     match (k.kind) {
-        KeyKind.Ed25519 => crypto.ed25519_sign(ed25519_seed(k)?, msg).ok_or("Ed25519 signing failed"),
+        KeyKind.Ed25519 => crypto.ed25519_sign(k.pkcs8, msg).ok_or("Ed25519 signing failed"),
         KeyKind.P256 => crypto.p256_sign(k.pkcs8, msg),
         KeyKind.Rsa(_) => crypto.rsa_pkcs1_sign(k.pkcs8, msg),
     }

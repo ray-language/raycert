@@ -15,9 +15,11 @@ fn ed25519_pkcs8_matches_rfc_8410() {
         .unwrap();
     let k = keys.from_pem(RFC8410_PEM).unwrap();
     assert_eq(keys.kind_name(k.kind), "ed25519");
-    assert_eq(keys.ed25519_seed(k).unwrap(), seed);
+    assert_eq(crypto.ed25519_seed_of(k.pkcs8).unwrap(), seed);
     assert_eq(
-        keys.to_pem(keys.PrivKey { kind: KeyKind.Ed25519, pkcs8: keys.ed25519_pkcs8(seed) }),
+        keys.to_pem(
+            keys.PrivKey { kind: KeyKind.Ed25519, pkcs8: crypto.ed25519_pkcs8_of(seed).unwrap() }
+        ),
         RFC8410_PEM
     );
     assert_eq(

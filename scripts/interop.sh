@@ -101,6 +101,25 @@ for spec in "rsa:2048" "ed25519"; do
         "$(openssl req -in "$OUT/x.csr" -noout -pubkey | openssl sha256)"
 done
 
+echo "== openssl chains beyond P-256/SHA-256"
+# P-384 root (ecdsa-with-SHA384) -> RSA intermediate -> leaves signed sha384WithRSA and sha512WithRSA.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-384 -sha384 -nodes -keyout "$OUT/r384.key" \
+    -out "$OUT/r384.pem" -days 10 -subj "/CN=Oracle P-384 Root" \
+    -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign" 2>/dev/null
+openssl req -new -newkey rsa:3072 -nodes -keyout "$OUT/irsa.key" -out "$OUT/irsa.csr" -subj "/CN=Oracle RSA Intermediate" 2>/dev/null
+printf 'basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign\n' >"$OUT/ca.ext"
+openssl x509 -req -in "$OUT/irsa.csr" -CA "$OUT/r384.pem" -CAkey "$OUT/r384.key" -sha384 -days 10 \
+    -extfile "$OUT/ca.ext" -out "$OUT/irsa.pem" 2>/dev/null
+for h in sha384 sha512; do
+    openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$OUT/l-$h.key" -out "$OUT/l-$h.csr" \
+        -subj "/CN=leaf-$h.test" 2>/dev/null
+    openssl x509 -req -in "$OUT/l-$h.csr" -CA "$OUT/irsa.pem" -CAkey "$OUT/irsa.key" -"$h" -days 10 -out "$OUT/l-$h.pem" 2>/dev/null
+    cat "$OUT/l-$h.pem" "$OUT/irsa.pem" "$OUT/r384.pem" >"$OUT/chain-$h.pem"
+    check "openssl chain (leaf ${h}WithRSA): openssl verify" openssl verify -CAfile "$OUT/r384.pem" -untrusted "$OUT/irsa.pem" "$OUT/l-$h.pem"
+    same "openssl chain (leaf ${h}WithRSA, RSA under ecdsa-with-SHA384 P-384): raycert verifies all 3 links" \
+        "$("$RAYCERT" inspect "$OUT/chain-$h.pem" 2>&1 | grep -c ': valid')" "3"
+done
+
 echo "== TLS with openssl s_server"
 for proto in -tls1_2 ""; do
     P=$(free_port)
@@ -125,8 +144,14 @@ openssl s_server -accept "$P" -cert "$H/certs/web/chain.pem" -key "$H/certs/web/
 PID=$!
 PIDS+=("$PID")
 if wait_port "$P"; then
-    check "TLS 1.3-only server: raycert explains it cannot read the chain" sh -c \
-        "'$RAYCERT' inspect 127.0.0.1:$P 2>&1 | grep -q 'protocol_version'"
+    # s_server -cert sends only the leaf: one link, the leaf against the --ca anchor.
+    "$RAYCERT" inspect "127.0.0.1:$P" --ca "$H/ca/ca.pem" >"$OUT/inspect13.log" 2>&1
+    same "TLS 1.3-only server: raycert inspect reads the served leaf" \
+        "$(awk '/SHA-256:/ {print $2; exit}' "$OUT/inspect13.log")" "$(sha256_of "$H/certs/web/cert.pem")"
+    same "TLS 1.3-only server: the leaf verifies against the raycert CA" \
+        "$(grep -c 'signed by .*: valid' "$OUT/inspect13.log")" "1"
+else
+    ko "TLS 1.3-only s_server did not start"
 fi
 stop_pid "$PID"
 

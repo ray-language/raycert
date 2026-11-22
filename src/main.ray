@@ -104,9 +104,7 @@ fn cmd_inspect(a: Args) -> Result<int, string> {
     match (ops.split_host_port(target)) {
         Option.Some((host, port)) => {
             certs = ops.remote_chain(host, port)?;
-            print(
-                "${host}:${port} presented ${certs.len()} certificate(s) (TLS 1.2 handshake, read by hand)"
-            );
+            print("${host}:${port} presented ${certs.len()} certificate(s)");
             anchors = ops.system_anchors();
         },
         Option.None => {

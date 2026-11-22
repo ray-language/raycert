@@ -20,19 +20,17 @@ pub fn default_home() -> string {
     }
 }
 
-/// A directory only its owner can enter (created if missing; mode tightened if it existed).
+/// A directory only its owner can enter: created 0700 if missing, tightened to 0700 if it
+/// already existed (`mkdir_mode` leaves the bits of an existing directory alone).
 pub fn private_dir(path: string) -> Result<int, string> {
-    fs.mkdir(path)?;
+    fs.mkdir_mode(path, PRIVATE_DIR)?;
     fs.chmod(path, PRIVATE_DIR)
 }
 
-/// Writes a secret file 0600. std/fs has no "create with mode" (nor umask), so the file is first
-/// created EMPTY, narrowed to 0600, and only then filled: the window where another user could
-/// open it holds no secret. (The parent directory is 0700 too.)
+/// Writes a secret file 0600: `write_file_mode` creates it with that mode (or narrows an existing
+/// one) before writing, so it never holds the secret with looser bits.
 pub fn write_private(path: string, content: string) -> Result<int, string> {
-    fs.write_file(path, "")?;
-    fs.chmod(path, PRIVATE_FILE)?;
-    fs.write_file(path, content)
+    fs.write_file_mode(path, content, PRIVATE_FILE)
 }
 
 /// Writes through a temporary sibling and rename, so a reader (raygate reloading) never sees half
